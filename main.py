@@ -43,6 +43,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "só serve para depurar a detecção.",
     )
     parser.add_argument(
+        "--debug-gestos",
+        action="store_true",
+        help="Mostra no HUD os valores ao vivo usados pelos gestos (fps de "
+             "detecção, abertura dos dedos, pinça). Use para calibrar os "
+             "limiares de config.py para a sua mão.",
+    )
+    parser.add_argument(
+        "--uma-mao",
+        action="store_true",
+        help="Detecta só uma mão (2x mais rápido). Útil em hardware fraco.",
+    )
+    parser.add_argument(
         "--sem-ar",
         action="store_true",
         help="Desliga a realidade aumentada: o sólido volta a aparecer sobre "
@@ -63,6 +75,8 @@ def main() -> int:
         config.CAMERA_URL = args.camera_url
     if args.sem_ar:
         config.AR_ATIVO = False
+    if args.uma_mao:
+        config.HAND_MAX_NUM_HANDS = 1
 
     tetraedro = Tetraedro(
         aresta=config.ARESTA_INICIAL,
@@ -77,7 +91,11 @@ def main() -> int:
         try:
             from vision.hand_tracker import FonteEntradaGestos
 
-            fonte_gestos = FonteEntradaGestos(config=config, mostrar_janela_debug=args.janela_debug)
+            fonte_gestos = FonteEntradaGestos(
+                config=config,
+                mostrar_janela_debug=args.janela_debug,
+                mostrar_diagnostico=args.debug_gestos,
+            )
             fonte_entrada = fonte_gestos
         except Exception as erro:
             print(f"Falha ao iniciar rastreamento de mão ({erro}); usando mouse/teclado.", file=sys.stderr)

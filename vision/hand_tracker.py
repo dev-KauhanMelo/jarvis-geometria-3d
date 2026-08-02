@@ -9,9 +9,15 @@ import time
 from dataclasses import dataclass
 from math import sqrt
 from pathlib import Path
-from typing import Callable, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
-from render.viewer import EstadoEntrada
+if TYPE_CHECKING:  # pragma: no cover
+    from render.viewer import EstadoEntrada
+
+# `EstadoEntrada` é importado tardiamente (dentro dos métodos que o usam) para
+# quebrar o ciclo render.viewer -> interaction.gestos -> vision.hand_tracker.
+# As funções puras deste módulo não dependem dele, e é justamente elas que a
+# camada de interação consome.
 
 Landmarks = Sequence[tuple[float, float, float]]
 
@@ -62,6 +68,125 @@ def abertura_mao(landmarks: Landmarks) -> float:
 
 def mao_fechada(landmarks: Landmarks, limiar: float) -> bool:
     return abertura_mao(landmarks) < limiar
+
+
+# ---------------------------------------------------------------------------
+# Curvatura dos dedos e orientação da palma (Etapa 3)
+# ---------------------------------------------------------------------------
+# Cada dedo como cadeia MCP -> PIP -> DIP -> ponta.
+CADEIAS_DEDOS: dict[str, tuple[int, int, int, int]] = {
+    "indicador": (5, 6, 7, 8),
+    "medio": (9, 10, 11, 12),
+    "anelar": (13, 14, 15, 16),
+    "mindinho": (17, 18, 19, 20),
+}
+
+
+def _distancia_3d(a, b) -> float:
+    return sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2)
+
+
+def extensao_dedo(landmarks: Landmarks, cadeia: tuple[int, int, int, int]) -> float:
+    """Razão corda/arco do dedo: |ponta - MCP| dividido pelo comprimento total.
+
+    Vale ~1,0 com o dedo reto e cai para ~0,25-0,45 totalmente dobrado. É
+    adimensional e não depende de normalizar pelo tamanho da mão.
+
+    Usar de preferência com `hand_world_landmarks` (3D métrico), onde fica
+    imune ao encurtamento por perspectiva. Medi nas fotos reais: punho
+    [0,31 0,25 0,33 0,46], apontando [0,96 0,35 0,41 0,42], vitória
+    [0,94 0,99 0,62 0,55] — em 2D os mesmos gestos separam bem menos.
+    """
+    mcp, pip, dip, ponta = (landmarks[i] for i in cadeia)
+    arco = _distancia_3d(mcp, pip) + _distancia_3d(pip, dip) + _distancia_3d(dip, ponta)
+    if arco < 1e-9:
+        return 0.0
+    return _distancia_3d(mcp, ponta) / arco
+
+
+def extensoes_dedos(landmarks: Landmarks) -> tuple[float, float, float, float]:
+    """(indicador, médio, anelar, mindinho), na ordem de CADEIAS_DEDOS."""
+    return tuple(extensao_dedo(landmarks, cadeia) for cadeia in CADEIAS_DEDOS.values())
+
+
+def mao_em_concha(
+    extensoes: Sequence[float],
+    pinca: float,
+    minimo: float = 0.50,
+    maximo: float = 0.88,
+    pinca_minima: float = 0.50,
+) -> bool:
+    """Mão em concha/garra — "carregando um poder na mão".
+
+    Exige que os QUATRO dedos estejam semi-dobrados: nenhum esticado
+    (`max <= maximo`) e nenhum totalmente fechado (`min >= minimo`), com a
+    pinça aberta (senão o gesto de agarrar dispararia junto).
+
+    Recebe as extensões já calculadas em vez dos landmarks de propósito: fica
+    trivial de testar e permite alimentar com os valores já suavizados do
+    render, sem recalcular.
+
+    `abertura_mao` não serve para isso: uma concha vista de topo tem as pontas
+    quase tão próximas do centroide quanto um punho.
+    """
+    if pinca < pinca_minima:
+        return False
+    return min(extensoes) >= minimo and max(extensoes) <= maximo
+
+
+def matriz_orientacao_palma(world_landmarks: Landmarks, destra: bool = True):
+    """Base ortonormal da palma a partir dos world landmarks.
+
+    Usa pulso e as juntas MCP — os cinco pontos mais estáveis da mão — e nunca
+    as pontas dos dedos, cujo ruído viraria tremor na rotação do objeto.
+
+    Devolve a matriz já convertida para os eixos do OpenGL. Levanta ValueError
+    se a mão estiver degenerada (pontos colineares).
+    """
+    from geometry.transformacoes import base_destra, subtrair
+
+    pulso = world_landmarks[PULSO]
+    indicador = world_landmarks[INDICADOR_MCP]
+    mindinho = world_landmarks[MINDINHO_MCP]
+
+    ao_longo = subtrair(indicador, pulso)   # através da palma
+    para_cima = subtrair(mindinho, pulso)
+
+    # A ordem do produto vetorial depende da mão, senão a normal da palma
+    # aponta para dentro numa delas e o giro sai invertido.
+    normal = (
+        _produto_vetorial(ao_longo, para_cima) if destra
+        else _produto_vetorial(para_cima, ao_longo)
+    )
+    matriz = base_destra(normal, subtrair(_media(indicador, mindinho), pulso))
+    return converter_orientacao_mp_para_gl(matriz)
+
+
+def _produto_vetorial(a, b):
+    return (
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
+
+
+def _media(a, b):
+    return ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2)
+
+
+def converter_orientacao_mp_para_gl(matriz):
+    """Troca de eixos de imagem (y para baixo, z afastando) para eixos do
+    OpenGL (y para cima, z em direção ao observador), via S·M·S com
+    S = diag(1,-1,-1).
+
+    Como det(S) = +1 e S é sua própria inversa, a similaridade preserva a
+    rotação. Sem isso o giro sai invertido em dois eixos — o sintoma é
+    "mexo a mão para cima e ele gira para baixo".
+    """
+    s = ((1.0, 0.0, 0.0), (0.0, -1.0, 0.0), (0.0, 0.0, -1.0))
+    from geometry.transformacoes import multiplicar_matrizes
+
+    return multiplicar_matrizes(multiplicar_matrizes(s, matriz), s)
 
 
 def suavizar_ema(bruto: float, suavizado_anterior: Optional[float], alfa: float) -> float:
@@ -169,8 +294,10 @@ class FonteEntradaGestos:
     # A criação do detector e a chamada de detecção migraram para
     # `vision/rastreador.py`, que as executa na thread dedicada.
 
-    def _processar_landmarks(self, landmarks: Landmarks) -> EstadoEntrada:
+    def _processar_landmarks(self, landmarks: Landmarks) -> "EstadoEntrada":
         cfg = self.config
+        from render.viewer import EstadoEntrada
+
         estado = EstadoEntrada()
 
         pos_x, pos_y = posicao_mao(landmarks)
@@ -242,8 +369,10 @@ class FonteEntradaGestos:
             mp_vision.drawing_styles.get_default_hand_connections_style(),
         )
 
-    def capturar(self) -> EstadoEntrada:
+    def capturar(self) -> "EstadoEntrada":
         import cv2
+
+        from render.viewer import EstadoEntrada
 
         estado = EstadoEntrada()
 

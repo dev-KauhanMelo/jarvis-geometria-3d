@@ -56,8 +56,23 @@ from OpenGL.GLU import gluDeleteQuadric, gluNewQuadric, gluPerspective, gluSpher
 
 from config import Config
 from geometry.tetraedro import Tetraedro, calcular_normal_face
-from render.ar import FundoCamera
-from render.hud import AMBAR, BRANCO, VERDE, ContextoOrtografico, PainelHUD
+from interaction.controlador import ControladorInteracao
+from interaction.gestos import ComandoInteracao, Fase
+from render.ar import FundoCamera, mapear_uv_para_tela
+from render.hud import (
+    AMBAR,
+    BRANCO,
+    VERDE,
+    ContextoOrtografico,
+    PainelHUD,
+    desenhar_anel,
+    desenhar_circulo,
+)
+
+# Cores do feedback de manipulação (0-1, para o OpenGL).
+COR_LIVRE = (0.85, 0.88, 0.95)      # mão presente, nada agarrado
+COR_AGARRANDO = (0.35, 0.95, 0.55)  # gesto ativo
+COR_MIRA = (1.0, 0.78, 0.20)        # vértice que seria pego
 from render.projecao import ProjetorOpenGL
 from geometry.transformacoes import (
     QUAT_IDENTIDADE,
@@ -146,7 +161,46 @@ class FonteEntradaMouseTeclado:
         if teclas[pygame.K_MINUS] or teclas[pygame.K_KP_MINUS] or teclas[pygame.K_DOWN]:
             estado.delta_aresta -= self.velocidade_aresta
 
+        # Mão sintética no botão direito: exercita a máquina de gestos (mira,
+        # seleção e arrasto de vértice) sem câmera nenhuma. É o único caminho
+        # para testar a deformação num ambiente sem webcam.
+        mao = self._mao_sintetica()
+        if mao is not None:
+            estado.maos = (mao,)
+
         return estado
+
+    def _mao_sintetica(self):
+        """Uma `MaoDetectada` posicionada no cursor do mouse.
+
+        Botão direito pressionado = pinça fechada (agarrando). Os landmarks
+        são degenerados de propósito: só a posição da palma e o valor da pinça
+        importam para o picking, e a orientação (gesto da concha) não é
+        acessível pelo mouse.
+        """
+        from vision.rastreador import MaoDetectada
+
+        botoes = pygame.mouse.get_pressed(num_buttons=3)
+        if not (botoes[2] or botoes[0]):
+            return None
+
+        largura, altura = pygame.display.get_surface().get_size()
+        x, y = pygame.mouse.get_pos()
+        u, v = x / max(largura, 1), y / max(altura, 1)
+
+        # Pinça fechada só no botão direito; o esquerdo segue girando pelo
+        # caminho legado de deltas.
+        agarrando = botoes[2]
+        polegar = (u, v, 0.0)
+        indicador = (u + (0.0 if agarrando else 0.3), v, 0.0)
+        landmarks = [(u, v, 0.0)] * 21
+        landmarks[4] = polegar
+        landmarks[8] = indicador
+        landmarks[9] = (u, v + 0.1, 0.0)  # dá tamanho de mão não nulo
+        return MaoDetectada(
+            landmarks=tuple(landmarks), world_landmarks=(),
+            destra=True, confianca_lado=1.0, id_mao=9000,
+        )
 
 
 def _quaternion_de_arrasto(delta_x: float, delta_y: float) -> Quat:
@@ -203,6 +257,12 @@ class Viewer:
         self._hud: Optional[PainelHUD] = None
         self._estado_camera: Optional[str] = None
         self._diagnostico: tuple[str, ...] = ()
+
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+        self._controlador = ControladorInteracao(self.config)
+        self._comando = ComandoInteracao()
+        self._frame_id_gesto = 0
 
     def executar(self) -> None:
         self._configurar_janela()
@@ -276,6 +336,8 @@ class Viewer:
             self.tetraedro.resetar()
             self.orientacao = self.orientacao_inicial
             self.distancia_camera = self.distancia_inicial
+            self.pan_x = self.pan_y = 0.0
+            self._controlador.resetar()
 
         if estado.sair:
             self._deve_sair = True
@@ -284,6 +346,62 @@ class Viewer:
             self._fundo.atualizar(estado.frame_camera)
         self._estado_camera = estado.estado_camera
         self._diagnostico = estado.diagnostico
+
+        self._processar_gestos(estado)
+
+    def _mapear_para_tela(self, u: float, v: float) -> tuple[float, float]:
+        """Landmark normalizado -> pixel da janela.
+
+        Passa pelo mesmo ajuste que o fundo AR sofreu; é o que faz o cursor
+        cair exatamente sobre a mão no vídeo. Sem AR, mapeia direto na janela.
+        """
+        ajuste = self._fundo.ajuste_atual(self.largura, self.altura)
+        if ajuste is None:
+            return (u * self.largura, v * self.altura)
+        return mapear_uv_para_tela(u, v, ajuste)
+
+    def _processar_gestos(self, estado: EstadoEntrada) -> None:
+        """Traduz as mãos em comandos e aplica na cena."""
+        if not estado.maos:
+            self._comando = ComandoInteracao()
+            if self._controlador.estado.fase is not Fase.OCIOSO:
+                self._controlador.resetar()
+            self._controlador.maos_suaves = ()
+            return
+
+        self._frame_id_gesto += 1
+        comando = self._controlador.avaliar(
+            estado.maos, self._projetor, self.tetraedro, self.orientacao,
+            self._mapear_para_tela, self._frame_id_gesto,
+        )
+        self._comando = comando
+        self._aplicar_comando(comando)
+
+    def _aplicar_comando(self, comando: ComandoInteracao) -> None:
+        if comando.orientacao_absoluta is not None:
+            self.orientacao = comando.orientacao_absoluta
+
+        dx, dy = comando.delta_orbita_tela
+        if dx or dy:
+            sensibilidade = self.config.SENSIBILIDADE_ORBITA_PX
+            arrasto = _quaternion_de_arrasto(dx * sensibilidade, dy * sensibilidade)
+            self.orientacao = normalizar_quaternion(
+                multiplicar_quaternions(arrasto, self.orientacao)
+            )
+
+        if comando.escala_absoluta is not None:
+            atual = self.tetraedro.aresta
+            if atual > 0 and comando.escala_absoluta > 0:
+                self.tetraedro.escalar(comando.escala_absoluta / atual)
+
+        px, py = comando.delta_pan_tela
+        if px or py:
+            sensibilidade = self.config.SENSIBILIDADE_PAN_PX
+            self.pan_x += px * sensibilidade
+            self.pan_y -= py * sensibilidade  # y da tela cresce para baixo
+
+        if comando.vertice_movido is not None and comando.posicao_vertice_objeto is not None:
+            self.tetraedro.mover_vertice(comando.vertice_movido, comando.posicao_vertice_objeto)
 
     def _renderizar_frame(self) -> None:
         # O fundo limpa a tela (com o vídeo ou com a cor sólida) e o sólido
@@ -298,7 +416,7 @@ class Viewer:
     def _desenhar_solido(self) -> None:
         glMatrixMode(GL_MODELVIEW)
         glLoadIdentity()
-        glTranslatef(0.0, 0.0, -self.distancia_camera)
+        glTranslatef(self.pan_x, self.pan_y, -self.distancia_camera)
         glMultMatrixf(matriz4_coluna_maior_de_quaternion(self.orientacao))
         # Captura as matrizes com a modelview do SÓLIDO ativa: é o que torna a
         # seleção de vértice possível (fatia 3E).
@@ -376,6 +494,12 @@ class Viewer:
             (f"Altura: {t.altura():.3f}", BRANCO),
             (f"Apótema da face: {t.apotema_face():.3f}", BRANCO),
         ]
+        if self._comando.mensagem:
+            linhas.append((f"» {self._comando.mensagem}", VERDE))
+        elif self._controlador.maos_suaves:
+            n = len(self._controlador.maos_suaves)
+            linhas.append((f"{n} mão(s) — feche a pinça para pegar", BRANCO))
+
         if self._estado_camera is not None:
             cor = VERDE if self._estado_camera == "conectado" else AMBAR
             linhas.append((f"Câmera: {self._estado_camera}", cor))
@@ -386,4 +510,36 @@ class Viewer:
         if self._hud is None:
             return
         with ContextoOrtografico(self.largura, self.altura):
+            self._desenhar_cursores()
+            self._desenhar_realce_vertice()
             self._hud.desenhar(self._linhas_hud())
+
+    def _desenhar_cursores(self) -> None:
+        """Um cursor por mão: anel vazado quando solta, disco cheio quando
+        agarrando. É o que torna o modelo de controle legível — sem isso o
+        usuário não tem como saber que precisa fechar a pinça."""
+        agarrando_agora = self._comando.fase is not Fase.OCIOSO
+        ancora = self._controlador.estado.id_mao_ancora
+        secundaria = self._controlador.estado.id_mao_secundaria
+
+        for mao in self._controlador.maos_suaves:
+            x, y = mao.cursor_tela
+            ativa = agarrando_agora and mao.id_mao in (ancora, secundaria)
+            if ativa:
+                desenhar_circulo(x, y, 13.0, COR_AGARRANDO, alfa=0.85)
+                desenhar_anel(x, y, 20.0, COR_AGARRANDO, alfa=0.9, espessura=2.0)
+            else:
+                desenhar_anel(x, y, 15.0, COR_LIVRE, alfa=0.75, espessura=2.0)
+
+    def _desenhar_realce_vertice(self) -> None:
+        """Anel em volta do vértice sob a mira, para o usuário saber o que vai
+        pegar ANTES de fechar a pinça."""
+        indice = self._comando.vertice_sob_mira
+        if indice is None or not self._projetor.pronto:
+            return
+        projetado = self._projetor.projetar(self.tetraedro.vertices()[indice])
+        if projetado is None:
+            return
+        arrastando = self._comando.vertice_movido is not None
+        cor = COR_AGARRANDO if arrastando else COR_MIRA
+        desenhar_anel(projetado[0], projetado[1], 18.0, cor, alfa=0.95, espessura=3.0)
