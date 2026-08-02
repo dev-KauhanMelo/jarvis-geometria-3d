@@ -6,7 +6,7 @@ precise mudar quando a fonte de controle trocar.
 """
 from dataclasses import dataclass
 from math import radians
-from typing import Optional, Protocol
+from typing import Any, Optional, Protocol
 
 import pygame
 from OpenGL.GL import (
@@ -21,47 +21,33 @@ from OpenGL.GL import (
     GL_MODELVIEW,
     GL_ONE_MINUS_SRC_ALPHA,
     GL_PROJECTION,
-    GL_RGBA,
     GL_SMOOTH,
     GL_SRC_ALPHA,
-    GL_TEXTURE_2D,
-    GL_TEXTURE_MAG_FILTER,
-    GL_TEXTURE_MIN_FILTER,
-    GL_LINEAR,
     GL_TRIANGLES,
-    GL_UNSIGNED_BYTE,
     GL_AMBIENT,
     GL_DIFFUSE,
     GL_POSITION,
     glBegin,
-    glBindTexture,
     glBlendFunc,
     glClear,
     glClearColor,
     glColor3f,
     glColor4f,
     glColorMaterial,
-    glDeleteTextures,
     glDepthMask,
     glDisable,
     glEnable,
     glEnd,
-    glGenTextures,
     glLightfv,
     glLineWidth,
     glLoadIdentity,
     glMatrixMode,
     glNormal3f,
-    glOrtho,
     glPopMatrix,
     glPushMatrix,
     glMultMatrixf,
     glShadeModel,
-    glTexCoord2f,
-    glTexImage2D,
-    glTexParameteri,
     glTranslatef,
-    glVertex2f,
     glVertex3f,
     glViewport,
 )
@@ -70,6 +56,9 @@ from OpenGL.GLU import gluDeleteQuadric, gluNewQuadric, gluPerspective, gluSpher
 
 from config import Config
 from geometry.tetraedro import Tetraedro, calcular_normal_face
+from render.ar import FundoCamera
+from render.hud import AMBAR, BRANCO, VERDE, ContextoOrtografico, PainelHUD
+from render.projecao import ProjetorOpenGL
 from geometry.transformacoes import (
     QUAT_IDENTIDADE,
     Quat,
@@ -84,8 +73,16 @@ from geometry.transformacoes import (
 
 @dataclass
 class EstadoEntrada:
-    """Delta de controle produzido por qualquer fonte de entrada
-    (mouse/teclado hoje, gestos de mão na Etapa 2)."""
+    """O que a fonte de entrada observou neste frame.
+
+    Campos das Etapas 1 e 2 são deltas de controle. Os da Etapa 3 são
+    *sensoriais*: descrevem o que as mãos e a câmera estão fazendo, sem
+    interpretar. A interpretação (qual vértice está sob a mão, o que o gesto
+    significa) depende da cena e por isso mora no Viewer, não aqui.
+
+    Todos os campos novos têm default inerte, então `FonteEntradaMouseTeclado`
+    continua válida sem alteração.
+    """
 
     delta_rotacao_x: float = 0.0
     delta_rotacao_y: float = 0.0
@@ -94,6 +91,11 @@ class EstadoEntrada:
     resetar: bool = False
     sair: bool = False
     redimensionado: Optional[tuple[int, int]] = None
+
+    # --- Etapa 3 ---
+    frame_camera: Any = None                 # np.ndarray BGR já espelhado, ou None
+    estado_camera: Optional[str] = None      # "conectado" | "reconectando" | "desconectado"
+    diagnostico: tuple[str, ...] = ()        # linhas extras para o HUD de depuração
 
 
 class FonteEntrada(Protocol):
@@ -192,6 +194,15 @@ class Viewer:
         self._fonte_texto = None
         self._deve_sair = False
 
+        self._projetor = ProjetorOpenGL()
+        self._fundo = FundoCamera(
+            modo_ajuste=self.config.AR_MODO_AJUSTE,
+            escurecimento=self.config.AR_ESCURECIMENTO_FUNDO,
+        )
+        self._hud: Optional[PainelHUD] = None
+        self._estado_camera: Optional[str] = None
+        self._diagnostico: tuple[str, ...] = ()
+
     def executar(self) -> None:
         self._configurar_janela()
         self._configurar_opengl()
@@ -205,6 +216,10 @@ class Viewer:
                 pygame.display.flip()
                 relogio.tick(self.config.FPS_ALVO)
         finally:
+            # Libera as texturas ANTES de destruir o contexto GL.
+            self._fundo.close()
+            if self._hud is not None:
+                self._hud.close()
             pygame.quit()
 
     def _configurar_janela(self) -> None:
@@ -215,6 +230,7 @@ class Viewer:
         )
         pygame.display.set_caption(self.config.TITULO_JANELA)
         self._fonte_texto = pygame.font.Font(None, 22)
+        self._hud = PainelHUD(self._fonte_texto)
         pygame.mouse.get_rel()  # descarta deslocamento acumulado antes do loop
 
     def _configurar_opengl(self) -> None:
@@ -263,8 +279,18 @@ class Viewer:
         if estado.sair:
             self._deve_sair = True
 
+        if self.config.AR_ATIVO:
+            self._fundo.atualizar(estado.frame_camera)
+        self._estado_camera = estado.estado_camera
+        self._diagnostico = estado.diagnostico
+
     def _renderizar_frame(self) -> None:
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        # O fundo limpa a tela (com o vídeo ou com a cor sólida) e o sólido
+        # vem por cima, em projeção perspectiva.
+        if self.config.AR_ATIVO:
+            self._fundo.desenhar(self.largura, self.altura)
+        else:
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         self._desenhar_solido()
         self._desenhar_overlay()
 
@@ -273,6 +299,9 @@ class Viewer:
         glLoadIdentity()
         glTranslatef(0.0, 0.0, -self.distancia_camera)
         glMultMatrixf(matriz4_coluna_maior_de_quaternion(self.orientacao))
+        # Captura as matrizes com a modelview do SÓLIDO ativa: é o que torna a
+        # seleção de vértice possível (fatia 3E).
+        self._projetor.capturar()
 
         vertices = self.tetraedro.vertices()
         faces = self.tetraedro.faces()
@@ -326,68 +355,34 @@ class Viewer:
         gluDeleteQuadric(quadrica)
         glEnable(GL_LIGHTING)
 
-    def _desenhar_overlay(self) -> None:
-        glMatrixMode(GL_PROJECTION)
-        glPushMatrix()
-        glLoadIdentity()
-        glOrtho(0, self.largura, self.altura, 0, -1, 1)
-        glMatrixMode(GL_MODELVIEW)
-        glPushMatrix()
-        glLoadIdentity()
-
-        glDisable(GL_DEPTH_TEST)
-        glDisable(GL_LIGHTING)
-        glEnable(GL_BLEND)
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-
-        linhas = [
-            f"Aresta (a): {self.tetraedro.aresta:.3f}",
-            f"Área total: {self.tetraedro.area_total():.3f}",
-            f"Volume: {self.tetraedro.volume():.3f}",
-            f"Altura: {self.tetraedro.altura():.3f}",
-            f"Apótema da face: {self.tetraedro.apotema_face():.3f}",
+    def _linhas_hud(self) -> list[tuple[str, tuple[int, int, int]]]:
+        """Texto do painel. Quando o sólido está deformado não existe uma
+        "aresta a" única, então mostra a média com o intervalo — escrever
+        "Aresta: 1.500" num sólido de arestas 1.5 a 2.4 seria mentir."""
+        t = self.tetraedro
+        if t.esta_regular():
+            linhas = [(f"Aresta (a): {t.aresta:.3f}", BRANCO)]
+        else:
+            medidas = t.comprimentos_arestas()
+            linhas = [
+                (f"Aresta média: {t.aresta_media():.3f}"
+                 f"  (min {min(medidas):.3f} / max {max(medidas):.3f})", AMBAR),
+                ("DEFORMADO — fórmulas do tetraedro regular não valem", AMBAR),
+            ]
+        linhas += [
+            (f"Área total: {t.area_total():.3f}", BRANCO),
+            (f"Volume: {t.volume():.3f}", BRANCO),
+            (f"Altura: {t.altura():.3f}", BRANCO),
+            (f"Apótema da face: {t.apotema_face():.3f}", BRANCO),
         ]
-        y = 10
-        for linha in linhas:
-            self._desenhar_texto(linha, 10, y)
-            y += 24
+        if self._estado_camera is not None:
+            cor = VERDE if self._estado_camera == "conectado" else AMBAR
+            linhas.append((f"Câmera: {self._estado_camera}", cor))
+        linhas += [(texto, BRANCO) for texto in self._diagnostico]
+        return linhas
 
-        glDisable(GL_BLEND)
-        glEnable(GL_LIGHTING)
-        glEnable(GL_DEPTH_TEST)
-
-        glMatrixMode(GL_PROJECTION)
-        glPopMatrix()
-        glMatrixMode(GL_MODELVIEW)
-        glPopMatrix()
-
-    def _desenhar_texto(self, texto: str, x: float, y: float) -> None:
-        superficie = self._fonte_texto.render(texto, True, (255, 255, 255))
-        largura, altura = superficie.get_size()
-        # flipped=False: a textura fica com origem em cima (v=0 = topo), o que
-        # já combina com os glTexCoord2f/glVertex2f usados abaixo (y cresce para baixo).
-        dados = pygame.image.tostring(superficie, "RGBA", False)
-
-        id_textura = glGenTextures(1)
-        glBindTexture(GL_TEXTURE_2D, id_textura)
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, largura, altura, 0, GL_RGBA, GL_UNSIGNED_BYTE, dados)
-
-        glEnable(GL_TEXTURE_2D)
-        glColor4f(1.0, 1.0, 1.0, 1.0)
-        glBegin(GL_TRIANGLES)
-        # dois triângulos formando o quad do texto (evita depender de GL_QUADS, removido no core profile)
-        for tx, ty, vx, vy in (
-            (0, 0, x, y),
-            (1, 0, x + largura, y),
-            (1, 1, x + largura, y + altura),
-            (0, 0, x, y),
-            (1, 1, x + largura, y + altura),
-            (0, 1, x, y + altura),
-        ):
-            glTexCoord2f(tx, ty)
-            glVertex2f(vx, vy)
-        glEnd()
-        glDisable(GL_TEXTURE_2D)
-        glDeleteTextures([id_textura])
+    def _desenhar_overlay(self) -> None:
+        if self._hud is None:
+            return
+        with ContextoOrtografico(self.largura, self.altura):
+            self._hud.desenhar(self._linhas_hud())

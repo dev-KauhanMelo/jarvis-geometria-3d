@@ -41,6 +41,17 @@ class Config:
     DURACAO_HOLD_RESET_S: float = 1.0
     INVERTER_ESPELHO_CAMERA: bool = False
 
+    # --- Etapa 3: realidade aumentada ---
+    # O sólido é composto sobre a imagem da câmera, na mesma janela.
+    AR_ATIVO: bool = True
+    # "preencher" cobre a janela cortando as bordas do frame; "caber" mostra o
+    # frame inteiro com barras pretas. Preencher é o padrão porque barra preta
+    # quebra a ilusão de que o objeto está no ambiente.
+    AR_MODO_AJUSTE: str = "preencher"
+    # Véu escuro sobre o vídeo: o sólido é semi-transparente e some sobre um
+    # ambiente claro ou movimentado. Suba se estiver difícil de enxergar.
+    AR_ESCURECIMENTO_FUNDO: float = 0.35
+
     # --- Etapa 3 (voz): reservado, ainda não usado ---
     # VOSK_MODEL_PATH: str = "models/vosk-model-small-pt"
     # PALAVRAS_ATIVACAO: tuple[str, ...] = ("jarvis", "tetraedro")

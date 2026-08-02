@@ -284,6 +284,12 @@ class FonteEntradaGestos:
             else:
                 self._estado_suavizado = _EstadoMaoSuavizado()
 
+        # Entrega o frame ao viewer para a composição AR (o sólido é desenhado
+        # por cima dele). Já vem espelhado, para o usuário se ver como num
+        # espelho e o gesto ir para o mesmo lado que a mão.
+        estado.frame_camera = frame
+        estado.estado_camera = self.camera.obter_estado().value
+
         self._desenhar_debug(frame, landmarks)
         return estado
 

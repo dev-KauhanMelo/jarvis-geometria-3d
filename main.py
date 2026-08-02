@@ -33,7 +33,20 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--sem-janela-debug",
         action="store_true",
-        help="Não abre a janela de debug com o feed da câmera e o esqueleto da mão.",
+        help=argparse.SUPPRESS,  # mantido por compatibilidade; a janela já é opt-in
+    )
+    parser.add_argument(
+        "--janela-debug",
+        action="store_true",
+        help="Abre a janela separada do OpenCV com o esqueleto da mão. "
+             "Desde a Etapa 3 o vídeo aparece na janela principal, então ela "
+             "só serve para depurar a detecção.",
+    )
+    parser.add_argument(
+        "--sem-ar",
+        action="store_true",
+        help="Desliga a realidade aumentada: o sólido volta a aparecer sobre "
+             "fundo escuro, sem o vídeo da câmera.",
     )
     parser.add_argument(
         "--camera-url",
@@ -48,6 +61,8 @@ def main() -> int:
     config = Config()
     if args.camera_url:
         config.CAMERA_URL = args.camera_url
+    if args.sem_ar:
+        config.AR_ATIVO = False
 
     tetraedro = Tetraedro(
         aresta=config.ARESTA_INICIAL,
@@ -62,7 +77,7 @@ def main() -> int:
         try:
             from vision.hand_tracker import FonteEntradaGestos
 
-            fonte_gestos = FonteEntradaGestos(config=config, mostrar_janela_debug=not args.sem_janela_debug)
+            fonte_gestos = FonteEntradaGestos(config=config, mostrar_janela_debug=args.janela_debug)
             fonte_entrada = fonte_gestos
         except Exception as erro:
             print(f"Falha ao iniciar rastreamento de mão ({erro}); usando mouse/teclado.", file=sys.stderr)
