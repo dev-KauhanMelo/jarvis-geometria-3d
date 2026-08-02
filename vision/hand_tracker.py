@@ -117,7 +117,13 @@ class FonteEntradaGestos:
     (capturados via MediaPipe HandLandmarker) em `EstadoEntrada`. Mesma
     interface de `FonteEntradaMouseTeclado` — o `Viewer` não muda."""
 
-    def __init__(self, camera=None, config=None, mostrar_janela_debug: bool = True) -> None:
+    def __init__(
+        self,
+        camera=None,
+        config=None,
+        mostrar_janela_debug: bool = True,
+        mostrar_diagnostico: bool = False,
+    ) -> None:
         # Import tardio: mediapipe/cv2/pygame só são necessários para uso real
         # (não para importar/testar as funções puras acima).
         import pygame
@@ -128,6 +134,7 @@ class FonteEntradaGestos:
         self._pygame = pygame
         self.config = config or Config()
         self.mostrar_janela_debug = mostrar_janela_debug
+        self.mostrar_diagnostico = mostrar_diagnostico
 
         modelo = Path(self.config.HAND_LANDMARKER_MODEL_PATH)
         if not modelo.exists():
@@ -148,37 +155,19 @@ class FonteEntradaGestos:
 
         self._detector_punho = DetectorPunhoSustentado(duracao_hold=self.config.DURACAO_HOLD_RESET_S)
         self._estado_suavizado = _EstadoMaoSuavizado()
-        self._ultimo_timestamp_ms = 0
 
-        self._landmarker = self._criar_hand_landmarker()
+        # A detecção roda em thread própria: o loop de render não espera por
+        # ela. Construir aqui (e não dentro da thread) mantém o contrato de
+        # main.py, que conta com a exceção de "modelo não encontrado" para
+        # cair no fallback de mouse/teclado.
+        from vision.rastreador import RastreadorMaos
+
+        self._rastreador = RastreadorMaos(self.camera, self.config).iniciar()
+        self._ultimo_frame_id = 0
         self._janela_debug_disponivel = mostrar_janela_debug
 
-    def _criar_hand_landmarker(self):
-        from mediapipe.tasks import python as mp_python
-        from mediapipe.tasks.python import vision as mp_vision
-
-        options = mp_vision.HandLandmarkerOptions(
-            base_options=mp_python.BaseOptions(model_asset_path=self.config.HAND_LANDMARKER_MODEL_PATH),
-            running_mode=mp_vision.RunningMode.VIDEO,
-            num_hands=self.config.HAND_MAX_NUM_HANDS,
-            min_hand_detection_confidence=self.config.HAND_MIN_DETECTION_CONFIDENCE,
-            min_tracking_confidence=self.config.HAND_MIN_TRACKING_CONFIDENCE,
-        )
-        return mp_vision.HandLandmarker.create_from_options(options)
-
-    def _detectar(self, frame_bgr):
-        import cv2
-        import mediapipe as mp
-
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        imagem_mp = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
-
-        timestamp_ms = int(time.monotonic() * 1000)
-        if timestamp_ms <= self._ultimo_timestamp_ms:
-            timestamp_ms = self._ultimo_timestamp_ms + 1
-        self._ultimo_timestamp_ms = timestamp_ms
-
-        return self._landmarker.detect_for_video(imagem_mp, timestamp_ms)
+    # A criação do detector e a chamada de detecção migraram para
+    # `vision/rastreador.py`, que as executa na thread dedicada.
 
     def _processar_landmarks(self, landmarks: Landmarks) -> EstadoEntrada:
         cfg = self.config
@@ -266,23 +255,33 @@ class FonteEntradaGestos:
             elif evento.type == self._pygame.VIDEORESIZE:
                 estado.redimensionado = (evento.w, evento.h)
 
+        # Frame para o fundo AR: vem direto da câmera (mais fresco) e não do
+        # snapshot da detecção (mais velho). O flip é o mesmo que a thread de
+        # detecção aplica, para que os landmarks e o vídeo concordem.
         frame = self.camera.obter_frame_mais_recente()
+        if frame is not None and not self.config.INVERTER_ESPELHO_CAMERA:
+            frame = cv2.flip(frame, 1)
+
+        snapshot = self._rastreador.obter_snapshot()
         landmarks: Optional[Landmarks] = None
 
-        if frame is not None:
-            if not self.config.INVERTER_ESPELHO_CAMERA:
-                frame = cv2.flip(frame, 1)
-            resultado = self._detectar(frame)
-            if resultado.hand_landmarks:
-                landmarks = [(lm.x, lm.y, lm.z) for lm in resultado.hand_landmarks[0]]
+        if snapshot.maos:
+            landmarks = list(snapshot.maos[0].landmarks)
+            # Os gestos da Etapa 2 acumulam deltas, então só podem ser
+            # processados uma vez por DETECÇÃO — a 60 fps de render sobre 19 fps
+            # de detecção, reprocessar o mesmo snapshot triplicaria a rotação.
+            if snapshot.frame_id != self._ultimo_frame_id:
+                self._ultimo_frame_id = snapshot.frame_id
                 gestos = self._processar_landmarks(landmarks)
                 estado.delta_rotacao_x = gestos.delta_rotacao_x
                 estado.delta_rotacao_y = gestos.delta_rotacao_y
                 estado.delta_zoom = gestos.delta_zoom
                 estado.delta_aresta = gestos.delta_aresta
                 estado.resetar = gestos.resetar
-            else:
-                self._estado_suavizado = _EstadoMaoSuavizado()
+        else:
+            self._estado_suavizado = _EstadoMaoSuavizado()
+
+        estado.maos = snapshot.maos
 
         # Entrega o frame ao viewer para a composição AR (o sólido é desenhado
         # por cima dele). Já vem espelhado, para o usuário se ver como num
@@ -290,12 +289,20 @@ class FonteEntradaGestos:
         estado.frame_camera = frame
         estado.estado_camera = self.camera.obter_estado().value
 
+        if self.mostrar_diagnostico:
+            m = self._rastreador.obter_metricas()
+            estado.diagnostico = (
+                f"detecção: {m.fps_deteccao:.0f} fps ({m.ms_por_deteccao:.0f} ms)"
+                f" | mãos: {len(snapshot.maos)}",
+            )
+
         self._desenhar_debug(frame, landmarks)
         return estado
 
     def close(self) -> None:
-        if self._landmarker is not None:
-            self._landmarker.close()
+        # O rastreador para a thread antes de fechar o detector; a câmera vem
+        # por último, porque a thread de detecção lê frames dela.
+        self._rastreador.close()
         self.camera.close()
         try:
             import cv2

@@ -93,6 +93,7 @@ class EstadoEntrada:
     redimensionado: Optional[tuple[int, int]] = None
 
     # --- Etapa 3 ---
+    maos: tuple = ()                         # MaoDetectada do último snapshot
     frame_camera: Any = None                 # np.ndarray BGR já espelhado, ou None
     estado_camera: Optional[str] = None      # "conectado" | "reconectando" | "desconectado"
     diagnostico: tuple[str, ...] = ()        # linhas extras para o HUD de depuração

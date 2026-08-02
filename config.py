@@ -22,7 +22,11 @@ class Config:
     CAMERA_FALHAS_CONSECUTIVAS_PARA_RECONECTAR: int = 5
 
     HAND_LANDMARKER_MODEL_PATH: str = "models/hand_landmarker.task"
-    HAND_MAX_NUM_HANDS: int = 1
+    # Duas mãos, para a manipulação a duas mãos da Etapa 3. Medi o custo: 51 ms
+    # por detecção contra 26 ms com uma só. Como a detecção roda em thread
+    # própria (vision/rastreador.py), isso não segura o render — mas com
+    # hardware fraco `--uma-mao` devolve a diferença.
+    HAND_MAX_NUM_HANDS: int = 2
     HAND_MIN_DETECTION_CONFIDENCE: float = 0.5
     HAND_MIN_TRACKING_CONFIDENCE: float = 0.5
 
