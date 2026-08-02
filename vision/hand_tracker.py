@@ -1,15 +1,19 @@
-"""Wrapper do MediaPipe Hands: converte landmarks da mão em `EstadoEntrada`.
+"""Wrapper do MediaPipe Hands: mede o que a mão está fazendo.
 
-As funções de cálculo puro (posição, pinça, abertura, suavização, dead zone,
-detecção de punho sustentado) não dependem do MediaPipe — recebem apenas
-listas de 21 tuplas (x, y, z) normalizadas, o que as torna testáveis com
-landmarks sintéticos, sem câmera nem modelo carregado.
+As funções de cálculo puro (posição, ponto da pinça, abertura, curvatura dos
+dedos, orientação da palma) não dependem do MediaPipe — recebem apenas listas
+de 21 tuplas (x, y, z) normalizadas, o que as torna testáveis com landmarks
+sintéticos, sem câmera nem modelo carregado.
+
+Este módulo só produz FATOS sobre a mão. Traduzi-los em movimento do sólido é
+tarefa de `interaction/gestos.py`. A Etapa 2 misturava as duas coisas aqui e
+convertia qualquer deslocamento da mão em rotação; quando a máquina de gestos
+da Etapa 3 entrou, as duas passaram a disputar o mesmo objeto. O controle
+contínuo foi removido — ver o comentário em `FonteEntradaGestos.capturar`.
 """
-import time
-from dataclasses import dataclass
 from math import sqrt
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Optional, Sequence
+from typing import TYPE_CHECKING, Optional, Sequence
 
 if TYPE_CHECKING:  # pragma: no cover
     from render.viewer import EstadoEntrada
@@ -55,6 +59,20 @@ def posicao_mao(landmarks: Landmarks) -> tuple[float, float]:
 def distancia_pinca(landmarks: Landmarks) -> float:
     """Distância polegar-ponta <-> indicador-ponta, normalizada por `tamanho_mao`."""
     return _distancia_xy(landmarks[POLEGAR_PONTA], landmarks[INDICADOR_PONTA]) / tamanho_mao(landmarks)
+
+
+def ponto_pinca(landmarks: Landmarks) -> tuple[float, float]:
+    """Onde os dedos se encontram: meio do caminho entre as pontas do polegar
+    e do indicador. É AQUI que o cursor deve ficar.
+
+    Antes o cursor usava `posicao_mao` (centroide da palma) e o erro era
+    grosseiro: medindo a foto "apontando", a palma cai em y=0,55 e a ponta do
+    indicador em y=0,20 — uns 270 px de distância numa janela de 768. O
+    usuário mira com o dedo e o programa lia a palma, então nada do que ele
+    apontava era o que ele pegava.
+    """
+    a, b = landmarks[POLEGAR_PONTA], landmarks[INDICADOR_PONTA]
+    return ((a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0)
 
 
 def abertura_mao(landmarks: Landmarks) -> float:
@@ -109,29 +127,20 @@ def extensoes_dedos(landmarks: Landmarks) -> tuple[float, float, float, float]:
     return tuple(extensao_dedo(landmarks, cadeia) for cadeia in CADEIAS_DEDOS.values())
 
 
-def mao_em_concha(
-    extensoes: Sequence[float],
-    pinca: float,
-    minimo: float = 0.50,
-    maximo: float = 0.88,
-    pinca_minima: float = 0.50,
-) -> bool:
-    """Mão em concha/garra — "carregando um poder na mão".
+def mao_em_garra(abertura: float, limiar: float) -> bool:
+    """Mão inteira fechando sobre algo — o gesto de apertar um balão.
 
-    Exige que os QUATRO dedos estejam semi-dobrados: nenhum esticado
-    (`max <= maximo`) e nenhum totalmente fechado (`min >= minimo`), com a
-    pinça aberta (senão o gesto de agarrar dispararia junto).
+    Substituiu a antiga `mao_em_concha`, que exigia uma POSE estática com os
+    quatro dedos semi-dobrados dentro de uma faixa estreita. Duas coisas
+    estavam erradas nela: o usuário descreveu um movimento de apertar
+    ("poing, poing"), não uma pose; e a faixa que aceitava a concha também
+    aceitava a mão relaxada, então o gesto disparava sozinho.
 
-    Recebe as extensões já calculadas em vez dos landmarks de propósito: fica
-    trivial de testar e permite alimentar com os valores já suavizados do
-    render, sem recalcular.
-
-    `abertura_mao` não serve para isso: uma concha vista de topo tem as pontas
-    quase tão próximas do centroide quanto um punho.
+    `abertura_mao` separa bem os casos que medi com o MediaPipe: punho 0,243,
+    dedo apontando 0,434, "vitória" 0,582. Um limiar em ~0,38 pega a mão
+    fechando e rejeita qualquer mão aberta.
     """
-    if pinca < pinca_minima:
-        return False
-    return min(extensoes) >= minimo and max(extensoes) <= maximo
+    return abertura < limiar
 
 
 def matriz_orientacao_palma(world_landmarks: Landmarks, destra: bool = True):
@@ -201,42 +210,6 @@ def aplicar_dead_zone(delta: float, limiar: float) -> float:
     return 0.0 if abs(delta) < limiar else delta
 
 
-class DetectorPunhoSustentado:
-    """Detecta punho fechado sustentado por `duracao_hold` segundos e
-    dispara exatamente uma vez por hold — é preciso reabrir a mão antes de
-    disparar de novo. Relógio injetável para permitir teste determinístico
-    sem `time.sleep` real."""
-
-    def __init__(self, duracao_hold: float = 1.0, relogio: Callable[[], float] = time.monotonic) -> None:
-        self.duracao_hold = duracao_hold
-        self._relogio = relogio
-        self._inicio_fechado: Optional[float] = None
-        self._disparado = False
-
-    def atualizar(self, mao_esta_fechada: bool) -> bool:
-        if not mao_esta_fechada:
-            self._inicio_fechado = None
-            self._disparado = False
-            return False
-
-        agora = self._relogio()
-        if self._inicio_fechado is None:
-            self._inicio_fechado = agora
-
-        if not self._disparado and (agora - self._inicio_fechado) >= self.duracao_hold:
-            self._disparado = True
-            return True
-        return False
-
-
-@dataclass
-class _EstadoMaoSuavizado:
-    posicao_x: Optional[float] = None
-    posicao_y: Optional[float] = None
-    pinca: Optional[float] = None
-    abertura: Optional[float] = None
-
-
 class FonteEntradaGestos:
     """Implementa `render.viewer.FonteEntrada` traduzindo gestos de mão
     (capturados via MediaPipe HandLandmarker) em `EstadoEntrada`. Mesma
@@ -278,9 +251,6 @@ class FonteEntradaGestos:
         )
         self.camera.iniciar()
 
-        self._detector_punho = DetectorPunhoSustentado(duracao_hold=self.config.DURACAO_HOLD_RESET_S)
-        self._estado_suavizado = _EstadoMaoSuavizado()
-
         # A detecção roda em thread própria: o loop de render não espera por
         # ela. Construir aqui (e não dentro da thread) mantém o contrato de
         # main.py, que conta com a exceção de "modelo não encontrado" para
@@ -293,40 +263,6 @@ class FonteEntradaGestos:
 
     # A criação do detector e a chamada de detecção migraram para
     # `vision/rastreador.py`, que as executa na thread dedicada.
-
-    def _processar_landmarks(self, landmarks: Landmarks) -> "EstadoEntrada":
-        cfg = self.config
-        from render.viewer import EstadoEntrada
-
-        estado = EstadoEntrada()
-
-        pos_x, pos_y = posicao_mao(landmarks)
-        pinca_bruta = distancia_pinca(landmarks)
-        abertura_bruta = abertura_mao(landmarks)
-
-        es = self._estado_suavizado
-        pos_x_suave = suavizar_ema(pos_x, es.posicao_x, cfg.ALFA_SUAVIZACAO)
-        pos_y_suave = suavizar_ema(pos_y, es.posicao_y, cfg.ALFA_SUAVIZACAO)
-        pinca_suave = suavizar_ema(pinca_bruta, es.pinca, cfg.ALFA_SUAVIZACAO)
-        abertura_suave = suavizar_ema(abertura_bruta, es.abertura, cfg.ALFA_SUAVIZACAO)
-
-        if es.posicao_x is not None:
-            delta_x = (pos_x_suave - es.posicao_x) * cfg.SENSIBILIDADE_ROTACAO_GESTO
-            delta_y = (pos_y_suave - es.posicao_y) * cfg.SENSIBILIDADE_ROTACAO_GESTO
-            delta_zoom = (pinca_suave - es.pinca) * cfg.SENSIBILIDADE_ZOOM_GESTO
-            delta_aresta = (abertura_suave - es.abertura) * cfg.SENSIBILIDADE_ARESTA_GESTO
-
-            estado.delta_rotacao_y = aplicar_dead_zone(delta_x, cfg.DEAD_ZONE_ROTACAO)
-            estado.delta_rotacao_x = aplicar_dead_zone(delta_y, cfg.DEAD_ZONE_ROTACAO)
-            estado.delta_zoom = aplicar_dead_zone(delta_zoom, cfg.DEAD_ZONE_ZOOM)
-            estado.delta_aresta = aplicar_dead_zone(delta_aresta, cfg.DEAD_ZONE_ARESTA)
-
-        self._estado_suavizado = _EstadoMaoSuavizado(pos_x_suave, pos_y_suave, pinca_suave, abertura_suave)
-
-        fechada = mao_fechada(landmarks, cfg.LIMIAR_MAO_FECHADA)
-        estado.resetar = self._detector_punho.atualizar(fechada)
-
-        return estado
 
     def _desenhar_debug(self, frame, landmarks: Optional[Landmarks]) -> None:
         if not self._janela_debug_disponivel or frame is None:
@@ -379,8 +315,16 @@ class FonteEntradaGestos:
         for evento in self._pygame.event.get():
             if evento.type == self._pygame.QUIT:
                 estado.sair = True
-            elif evento.type == self._pygame.KEYDOWN and evento.key == self._pygame.K_ESCAPE:
-                estado.sair = True
+            elif evento.type == self._pygame.KEYDOWN:
+                if evento.key == self._pygame.K_ESCAPE:
+                    estado.sair = True
+                elif evento.key == self._pygame.K_r:
+                    # Único jeito de resetar. Antes o reset era um gesto
+                    # (punho fechado por 1 s) e isso ficou insustentável: no
+                    # modelo novo o punho fechado é justamente como se SEGURA
+                    # o sólido, então segurá-lo por um segundo o mandava de
+                    # volta para a origem sozinho.
+                    estado.resetar = True
             elif evento.type == self._pygame.VIDEORESIZE:
                 estado.redimensionado = (evento.w, evento.h)
 
@@ -393,23 +337,17 @@ class FonteEntradaGestos:
 
         snapshot = self._rastreador.obter_snapshot()
         landmarks: Optional[Landmarks] = None
-
         if snapshot.maos:
             landmarks = list(snapshot.maos[0].landmarks)
-            # Os gestos da Etapa 2 acumulam deltas, então só podem ser
-            # processados uma vez por DETECÇÃO — a 60 fps de render sobre 19 fps
-            # de detecção, reprocessar o mesmo snapshot triplicaria a rotação.
-            if snapshot.frame_id != self._ultimo_frame_id:
-                self._ultimo_frame_id = snapshot.frame_id
-                gestos = self._processar_landmarks(landmarks)
-                estado.delta_rotacao_x = gestos.delta_rotacao_x
-                estado.delta_rotacao_y = gestos.delta_rotacao_y
-                estado.delta_zoom = gestos.delta_zoom
-                estado.delta_aresta = gestos.delta_aresta
-                estado.resetar = gestos.resetar
-        else:
-            self._estado_suavizado = _EstadoMaoSuavizado()
+        self._ultimo_frame_id = snapshot.frame_id
 
+        # Só fatos sobre as mãos daqui para baixo. O controle contínuo da
+        # Etapa 2 (que traduzia qualquer deslocamento da mão em rotação, e
+        # qualquer variação de abertura em tamanho de aresta) foi desligado:
+        # ele rodava EM PARALELO com a máquina de gestos da Etapa 3 e as duas
+        # brigavam pelo mesmo sólido. Era a maior parte do "ele fica se
+        # movendo loucamente" — o objeto reagia à mão mesmo sem ninguém tê-lo
+        # agarrado, e não havia como descansar a mão no quadro.
         estado.maos = snapshot.maos
 
         # Entrega o frame ao viewer para a composição AR (o sólido é desenhado

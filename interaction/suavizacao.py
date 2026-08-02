@@ -18,9 +18,13 @@ from geometry.transformacoes import (
     slerp,
 )
 from vision.hand_tracker import (
+    abertura_mao,
     distancia_pinca,
     extensoes_dedos,
     matriz_orientacao_palma,
+    ponto_pinca,
+    posicao_mao,
+    tamanho_mao,
 )
 
 
@@ -30,18 +34,31 @@ class MaoSuave:
 
     id_mao: int
     destra: bool
+    # Onde o polegar encontra o indicador. É o cursor que o usuário enxerga e
+    # com o qual mira um vértice — a ponta dos dedos, não o meio da palma.
     cursor_tela: tuple[float, float]
     pinca: float
     extensoes: tuple[float, float, float, float]
     orientacao: Quat
     visivel_ha_s: float
     landmarks_tela: tuple[tuple[float, float], ...] = ()
+    # Centroide da palma: com a mão fechada em garra as pontas dos dedos ficam
+    # amontoadas e o cursor treme, então quem manda na translação é a palma.
+    palma_tela: tuple[float, float] = (0.0, 0.0)
+    abertura: float = 1.0
+    # Pulso -> base do médio, em unidades normalizadas da imagem. Cresce quando
+    # a mão se aproxima da câmera: é o único proxy de profundidade disponível,
+    # já que o MediaPipe não dá distância absoluta.
+    tamanho: float = 0.3
 
 
 @dataclass
 class _EstadoMao:
     cursor: Optional[tuple[float, float]] = None
+    palma: Optional[tuple[float, float]] = None
     pinca: Optional[float] = None
+    abertura: Optional[float] = None
+    tamanho: Optional[float] = None
     extensoes: Optional[tuple[float, float, float, float]] = None
     orientacao: Quat = QUAT_IDENTIDADE
     tem_orientacao: bool = False
@@ -62,12 +79,17 @@ class SuavizadorMao:
         tau_escalares: float = 0.08,
         tau_pinca: float = 0.03,
         tau_orientacao: float = 0.12,
+        tau_tamanho: float = 0.25,
         tempo_esquecimento_s: float = 0.5,
     ) -> None:
         self.tau_posicao = tau_posicao
         self.tau_escalares = tau_escalares
         self.tau_pinca = tau_pinca
         self.tau_orientacao = tau_orientacao
+        # O tamanho aparente da mão é a medida mais ruidosa de todas (muda com
+        # o ângulo do punho, não só com a distância) e vira profundidade, que
+        # é justamente onde tremer incomoda mais. Daí a constante bem maior.
+        self.tau_tamanho = tau_tamanho
         self.tempo_esquecimento_s = tempo_esquecimento_s
         self._estados: dict[int, _EstadoMao] = {}
 
@@ -82,6 +104,7 @@ class SuavizadorMao:
         alfa_esc = alfa_temporal(dt, self.tau_escalares)
         alfa_ori = alfa_temporal(dt, self.tau_orientacao)
         alfa_pinca = alfa_temporal(dt, self.tau_pinca)
+        alfa_tam = alfa_temporal(dt, self.tau_tamanho)
 
         resultado: list[MaoSuave] = []
         for mao in maos_detectadas:
@@ -91,11 +114,19 @@ class SuavizadorMao:
                 self._estados[mao.id_mao] = estado
             estado.visto_em = agora
 
-            alvo_cursor = mapear_para_tela(*_centro_palma(mao.landmarks))
+            alvo_cursor = mapear_para_tela(*ponto_pinca(mao.landmarks))
             estado.cursor = _mesclar_ponto(estado.cursor, alvo_cursor, alfa_pos)
+
+            alvo_palma = mapear_para_tela(*posicao_mao(mao.landmarks))
+            estado.palma = _mesclar_ponto(estado.palma, alvo_palma, alfa_pos)
 
             alvo_pinca = distancia_pinca(mao.landmarks)
             estado.pinca = _mesclar(estado.pinca, alvo_pinca, alfa_pinca)
+
+            # A abertura decide a garra, que é um gatilho como a pinça: vale a
+            # mesma troca de suavidade por latência.
+            estado.abertura = _mesclar(estado.abertura, abertura_mao(mao.landmarks), alfa_pinca)
+            estado.tamanho = _mesclar(estado.tamanho, tamanho_mao(mao.landmarks), alfa_tam)
 
             # Extensões dos dedos preferem world landmarks: em 2D o
             # encurtamento por perspectiva confunde dedo dobrado com dedo
@@ -128,6 +159,9 @@ class SuavizadorMao:
                     landmarks_tela=tuple(
                         mapear_para_tela(p[0], p[1]) for p in mao.landmarks
                     ),
+                    palma_tela=estado.palma,
+                    abertura=estado.abertura,
+                    tamanho=estado.tamanho,
                 )
             )
 
@@ -147,14 +181,6 @@ class SuavizadorMao:
 
     def esquecer(self, id_mao: int) -> None:
         self._estados.pop(id_mao, None)
-
-
-def _centro_palma(landmarks) -> tuple[float, float]:
-    indices = (0, 5, 9, 13, 17)
-    return (
-        sum(landmarks[i][0] for i in indices) / len(indices),
-        sum(landmarks[i][1] for i in indices) / len(indices),
-    )
 
 
 def _mesclar(anterior: Optional[float], alvo: float, alfa: float) -> float:

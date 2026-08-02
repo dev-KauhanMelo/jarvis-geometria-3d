@@ -5,7 +5,7 @@ abstraída pelo protocolo `FonteEntrada`, para que o `Viewer` nunca
 precise mudar quando a fonte de controle trocar.
 """
 from dataclasses import dataclass
-from math import radians
+from math import radians, tan
 from typing import Any, Optional, Protocol
 
 import pygame
@@ -67,7 +67,7 @@ from geometry.transformacoes import (
     quaternion_de_euler_graus,
 )
 from interaction.controlador import ControladorInteracao
-from interaction.gestos import ComandoInteracao, Fase, esta_agarrando, esta_em_concha
+from interaction.gestos import ComandoInteracao, Fase, esta_agarrando, esta_em_garra
 from render.ar import FundoCamera, mapear_uv_para_tela
 from render.hud import (
     AMBAR,
@@ -162,9 +162,10 @@ class FonteEntradaMouseTeclado:
         if teclas[pygame.K_MINUS] or teclas[pygame.K_KP_MINUS] or teclas[pygame.K_DOWN]:
             estado.delta_aresta -= self.velocidade_aresta
 
-        # Mão sintética no botão direito: exercita a máquina de gestos (mira,
-        # seleção e arrasto de vértice) sem câmera nenhuma. É o único caminho
-        # para testar a deformação num ambiente sem webcam.
+        # Mão sintética nos botões direito e do meio: exercita a máquina de
+        # gestos (mira, seleção, arrasto de vértice e segurar o sólido) sem
+        # câmera nenhuma. É o único caminho para testar a manipulação num
+        # ambiente sem webcam.
         mao = self._mao_sintetica()
         if mao is not None:
             estado.maos = (mao,)
@@ -172,32 +173,45 @@ class FonteEntradaMouseTeclado:
         return estado
 
     def _mao_sintetica(self):
-        """Uma `MaoDetectada` posicionada no cursor do mouse.
+        """Uma `MaoDetectada` plausível, posicionada no cursor do mouse.
 
-        Botão direito pressionado = pinça fechada (agarrando). Os landmarks
-        são degenerados de propósito: só a posição da palma e o valor da pinça
-        importam para o picking, e a orientação (gesto da concha) não é
-        acessível pelo mouse.
+        Botão direito = pinça (pega um vértice e deforma).
+        Botão do meio = garra (segura o sólido inteiro e o arrasta).
+
+        Os landmarks não são degenerados: montá-los com uma palma e cinco
+        pontas de verdade é o que faz `abertura_mao` e `distancia_pinca`
+        renderem valores realistas, e portanto o que faz este caminho
+        exercitar a MESMA máquina de estados que a câmera alimenta. Só a
+        orientação da palma fica de fora (o mouse não tem como expressá-la),
+        então pelo mouse o sólido translada e aproxima, mas não gira.
         """
         from vision.rastreador import MaoDetectada
 
         botoes = pygame.mouse.get_pressed(num_buttons=3)
-        if not (botoes[2] or botoes[0]):
+        garra, pinca = botoes[1], botoes[2]
+        if not (garra or pinca):
             return None
 
         largura, altura = pygame.display.get_surface().get_size()
         x, y = pygame.mouse.get_pos()
         u, v = x / max(largura, 1), y / max(altura, 1)
 
-        # Pinça fechada só no botão direito; o esquerdo segue girando pelo
-        # caminho legado de deltas.
-        agarrando = botoes[2]
-        polegar = (u, v, 0.0)
-        indicador = (u + (0.0 if agarrando else 0.3), v, 0.0)
         landmarks = [(u, v, 0.0)] * 21
-        landmarks[4] = polegar
-        landmarks[8] = indicador
-        landmarks[9] = (u, v + 0.1, 0.0)  # dá tamanho de mão não nulo
+        landmarks[0] = (u, v + 0.10, 0.0)  # pulso, abaixo das juntas
+        for k, indice in enumerate((5, 9, 13, 17)):
+            landmarks[indice] = (u - 0.045 + k * 0.03, v, 0.0)
+
+        # Polegar e indicador simétricos em torno do mouse: o ponto médio
+        # deles é o cursor, então ele cai exatamente onde o mouse está.
+        meia_pinca = 0.0 if pinca else 0.05
+        landmarks[4] = (u - meia_pinca, v, 0.0)
+        landmarks[8] = (u + meia_pinca, v, 0.0)
+        # Na garra os outros dedos recolhem para a palma; na pinça ficam
+        # esticados, que é o que separa um gesto do outro.
+        ponta_livre = (u, v + 0.02, 0.0) if garra else (u, v - 0.09, 0.0)
+        for indice in (12, 16, 20):
+            landmarks[indice] = ponta_livre
+
         return MaoDetectada(
             landmarks=tuple(landmarks), world_landmarks=(),
             destra=True, confianca_lado=1.0, id_mao=9000,
@@ -374,21 +388,25 @@ class Viewer:
         comando = self._controlador.avaliar(
             estado.maos, self._projetor, self.tetraedro, self.orientacao,
             self._mapear_para_tela, self._frame_id_gesto,
+            distancia_camera=self.distancia_camera,
         )
         self._comando = comando
         self._aplicar_comando(comando)
 
+    def _unidades_por_pixel(self) -> float:
+        """Quanto vale um pixel da janela em unidades de mundo, no plano onde
+        o sólido está.
+
+        Existe para a translação ser 1:1 de verdade: o sólido acompanha a mão
+        na mesma velocidade, e continua acompanhando depois de aproximar ou
+        afastar. Uma constante fixa (o antigo SENSIBILIDADE_PAN_PX) só
+        acertava numa distância de câmera e errava em todas as outras.
+        """
+        return 2.0 * self.distancia_camera * tan(radians(45.0) / 2.0) / max(self.altura, 1)
+
     def _aplicar_comando(self, comando: ComandoInteracao) -> None:
         if comando.orientacao_absoluta is not None:
-            self.orientacao = comando.orientacao_absoluta
-
-        dx, dy = comando.delta_orbita_tela
-        if dx or dy:
-            sensibilidade = self.config.SENSIBILIDADE_ORBITA_PX
-            arrasto = _quaternion_de_arrasto(dx * sensibilidade, dy * sensibilidade)
-            self.orientacao = normalizar_quaternion(
-                multiplicar_quaternions(arrasto, self.orientacao)
-            )
+            self.orientacao = normalizar_quaternion(comando.orientacao_absoluta)
 
         if comando.escala_absoluta is not None:
             atual = self.tetraedro.aresta
@@ -397,9 +415,15 @@ class Viewer:
 
         px, py = comando.delta_pan_tela
         if px or py:
-            sensibilidade = self.config.SENSIBILIDADE_PAN_PX
-            self.pan_x += px * sensibilidade
-            self.pan_y -= py * sensibilidade  # y da tela cresce para baixo
+            escala = self._unidades_por_pixel()
+            self.pan_x += px * escala
+            self.pan_y -= py * escala  # y da tela cresce para baixo
+
+        if comando.distancia_camera_absoluta is not None:
+            self.distancia_camera = max(
+                self.distancia_min,
+                min(self.distancia_max, comando.distancia_camera_absoluta),
+            )
 
         if comando.vertice_movido is not None and comando.posicao_vertice_objeto is not None:
             self.tetraedro.mover_vertice(comando.vertice_movido, comando.posicao_vertice_objeto)
@@ -499,7 +523,7 @@ class Viewer:
             linhas.append((f"» {self._comando.mensagem}", VERDE))
         elif self._controlador.maos_suaves:
             n = len(self._controlador.maos_suaves)
-            linhas.append((f"{n} mão(s) — feche a pinça para pegar", BRANCO))
+            linhas.append((f"{n} mão(s) — feche a mão para pegar o sólido", BRANCO))
 
         if self._estado_camera is not None:
             cor = VERDE if self._estado_camera == "conectado" else AMBAR
@@ -511,28 +535,27 @@ class Viewer:
     def _linhas_calibracao(self) -> list[tuple[str, tuple[int, int, int]]]:
         """Valores crus por mão, para calibrar os limiares (`--debug-gestos`).
 
-        Os limiares da concha vêm de fotos onde consegui confirmar apenas os
-        NEGATIVOS (punho, dedo apontando e "vitória" são rejeitados). A faixa
-        que aceita a concha depende de quanto a mão de cada pessoa dobra, e é
-        isto aqui que permite ajustá-la: faça a concha, leia os quatro
-        números e mexa em CONCHA_EXTENSAO_MIN/MAX no config.py.
+        Os limiares vêm de fotos que passei pelo MediaPipe (punho, dedo
+        apontando, "vitória"), mas quanto cada mão fecha varia por pessoa. É
+        isto aqui que permite ajustar: feche a mão, leia `abert`, e mexa em
+        GARRA_FECHA/GARRA_ABRE no config.py.
         """
         if not getattr(self.config, "DEBUG_GESTOS", False):
             return []
 
         params = self._controlador.params
         linhas = [(
-            f"faixa da concha: {params.concha_min_entra:.2f}–{params.concha_max_entra:.2f}"
+            f"garra fecha < {params.garra_fecha:.2f}"
             f" | pinça fecha < {params.pinca_fecha:.2f}", BRANCO,
         )]
         for mao in self._controlador.maos_suaves:
-            ext = " ".join(f"{e:.2f}" for e in mao.extensoes)
-            concha = esta_em_concha(mao, params, False)
-            agarrando = esta_agarrando(mao, params, False)
-            marca = "CONCHA" if concha else ("PINÇA" if agarrando else "—")
-            cor = VERDE if (concha or agarrando) else BRANCO
+            garra = esta_em_garra(mao, params, False)
+            pinca = esta_agarrando(mao, params, False)
+            marca = "GARRA" if garra else ("PINÇA" if pinca else "—")
+            cor = VERDE if (garra or pinca) else BRANCO
             linhas.append((
-                f"mão {mao.id_mao} ext: {ext} | pinça: {mao.pinca:.2f} | {marca}", cor,
+                f"mão {mao.id_mao} abert: {mao.abertura:.2f} | pinça: {mao.pinca:.2f}"
+                f" | tam: {mao.tamanho:.3f} | {marca}", cor,
             ))
         return linhas
 

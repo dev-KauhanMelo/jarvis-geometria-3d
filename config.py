@@ -30,20 +30,11 @@ class Config:
     HAND_MIN_DETECTION_CONFIDENCE: float = 0.5
     HAND_MIN_TRACKING_CONFIDENCE: float = 0.5
 
-    SENSIBILIDADE_ROTACAO_GESTO: float = 200.0
-    SENSIBILIDADE_ZOOM_GESTO: float = 15.0
-    SENSIBILIDADE_ARESTA_GESTO: float = 3.0
-    DEAD_ZONE_ROTACAO: float = 0.015
-    DEAD_ZONE_ZOOM: float = 0.02
-    DEAD_ZONE_ARESTA: float = 0.01
-    ALFA_SUAVIZACAO: float = 0.4
-    # Calibrado com fotos reais processadas pelo MediaPipe: punho fechado ~0.24,
-    # um dedo esticado já sobe pra ~0.43 — 0.32 separa bem os dois casos. Ainda
-    # assim, é ponto de partida: pode precisar de ajuste fino por usuário/mão
-    # (ver valores brutos na janela de debug).
-    LIMIAR_MAO_FECHADA: float = 0.32
-    DURACAO_HOLD_RESET_S: float = 1.0
     INVERTER_ESPELHO_CAMERA: bool = False
+    # O controle contínuo da Etapa 2 (sensibilidades, dead zones, limiar de
+    # punho e hold de reset) saiu junto com o modo em que qualquer movimento da
+    # mão já mexia no sólido. Quem manda agora são os limiares de agarre logo
+    # abaixo, na seção da Etapa 3.
 
     # --- Etapa 3: realidade aumentada ---
     # O sólido é composto sobre a imagem da câmera, na mesma janela.
@@ -57,21 +48,25 @@ class Config:
     AR_ESCURECIMENTO_FUNDO: float = 0.35
 
     # --- Etapa 3: manipulação direta ---
-    # Pinça: fecha em PINCA_FECHA, mas só solta em PINCA_ABRE. A folga entre os
-    # dois é histerese — sem ela o objeto solta sozinho quando a mão treme em
-    # cima do limiar. Medi nas fotos: punho 0,13; mão aberta 0,99.
+    # Dois agarres distintos. Cada um fecha num limiar e só solta noutro mais
+    # frouxo: a folga é histerese, sem ela o objeto se solta sozinho quando a
+    # mão treme em cima do limiar.
+    #
+    # GARRA = a mão inteira fechando (apertar um balão). Pega o sólido todo.
+    # Medi `abertura_mao` com o MediaPipe: punho 0,243, dedo apontando 0,434,
+    # "vitória" 0,582. 0,38 fica no meio do vão entre fechar e apontar.
+    GARRA_FECHA: float = 0.38
+    GARRA_ABRE: float = 0.48
+    # PINÇA = só polegar e indicador, com a mão aberta. Pega um vértice.
+    # Medi `distancia_pinca`: punho 0,199; mão aberta ~1,05.
     PINCA_FECHA: float = 0.35
     PINCA_ABRE: float = 0.50
 
-    # Concha ("carregando um poder na mão"): todos os quatro dedos
-    # semi-dobrados. Medi as extensões (corda/arco) em fotos reais: punho
-    # [0,31 0,25 0,33 0,46], apontando [0,96 0,35 ...], vitória [0,94 0,99 ...] —
-    # os três são rejeitados. O positivo depende da SUA mão: rode
-    # `--debug-gestos`, faça a concha, leia os quatro números e ajuste.
-    CONCHA_EXTENSAO_MIN: float = 0.50
-    CONCHA_EXTENSAO_MAX: float = 0.88
-    CONCHA_EXTENSAO_MIN_SAI: float = 0.42
-    CONCHA_EXTENSAO_MAX_SAI: float = 0.94
+    # Quanto a mão pode chegar/afastar da câmera dentro de um mesmo agarre,
+    # como razão do tamanho aparente da mão. Serve de trava: uma leitura ruim
+    # do tamanho jogaria o sólido para o infinito ou para dentro da câmera.
+    RAZAO_PROFUNDIDADE_MIN: float = 0.6
+    RAZAO_PROFUNDIDADE_MAX: float = 1.7
 
     # Quão perto do vértice a mão precisa estar para pegá-lo (~6% da altura).
     RAIO_PICK_VERTICE_PX: float = 45.0
@@ -92,13 +87,17 @@ class Config:
     # o gesto parecia não responder. A histerese e o debounce já cuidam do
     # ruído, então aqui vale privilegiar a latência.
     TAU_PINCA: float = 0.03
+    # O tamanho aparente da mão vira PROFUNDIDADE, que é onde tremer mais
+    # incomoda, e é a medida mais ruidosa (muda com o ângulo do punho, não só
+    # com a distância). Por isso a constante é muito maior que as demais.
+    TAU_TAMANHO_MAO: float = 0.25
 
     # Ligado por --debug-gestos: mostra os valores crus no HUD para calibração.
     DEBUG_GESTOS: bool = False
 
-    # Conversão de pixels de tela para as unidades da cena.
-    SENSIBILIDADE_ORBITA_PX: float = 0.35   # graus de rotação por pixel
-    SENSIBILIDADE_PAN_PX: float = 0.006     # unidades de mundo por pixel
+    # A translação não tem constante de sensibilidade: o Viewer converte pixel
+    # em unidade de mundo pela geometria da câmera, então o sólido acompanha a
+    # mão exatamente 1:1 em qualquer nível de zoom.
 
     # --- Etapa 3 (voz): reservado, ainda não usado ---
     # VOSK_MODEL_PATH: str = "models/vosk-model-small-pt"

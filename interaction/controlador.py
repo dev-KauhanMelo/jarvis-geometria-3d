@@ -12,7 +12,6 @@ from geometry.transformacoes import Quat
 from interaction.gestos import (
     ComandoInteracao,
     EstadoInteracao,
-    Fase,
     ParametrosGesto,
     avaliar_gestos,
 )
@@ -22,10 +21,11 @@ from interaction.suavizacao import MaoSuave, SuavizadorMao
 class CenaProjetada:
     """Implementa `ContextoCena` a partir do projetor de OpenGL e do sólido."""
 
-    def __init__(self, projetor, tetraedro, orientacao: Quat) -> None:
+    def __init__(self, projetor, tetraedro, orientacao: Quat, distancia: float = 6.0) -> None:
         self._projetor = projetor
         self._tetraedro = tetraedro
         self._orientacao = orientacao
+        self._distancia = distancia
 
     def vertices_tela(self):
         if not self._projetor.pronto:
@@ -41,6 +41,9 @@ class CenaProjetada:
     def escala_objeto(self) -> float:
         return self._tetraedro.aresta
 
+    def distancia_camera(self) -> float:
+        return self._distancia
+
 
 class ControladorInteracao:
     """Mantém o estado da máquina de gestos e da suavização entre frames."""
@@ -52,6 +55,7 @@ class ControladorInteracao:
             tau_escalares=getattr(config, "TAU_ESCALARES_MAO", 0.08),
             tau_pinca=getattr(config, "TAU_PINCA", 0.03),
             tau_orientacao=getattr(config, "TAU_ORIENTACAO_MAO", 0.12),
+            tau_tamanho=getattr(config, "TAU_TAMANHO_MAO", 0.25),
         )
         self.estado = EstadoInteracao()
         self.maos_suaves: tuple[MaoSuave, ...] = ()
@@ -66,6 +70,7 @@ class ControladorInteracao:
         mapear_para_tela: Callable[[float, float], tuple[float, float]],
         frame_id: int,
         agora: Optional[float] = None,
+        distancia_camera: float = 6.0,
     ) -> ComandoInteracao:
         agora = time.monotonic() if agora is None else agora
         dt = 0.0 if self._ultimo_instante is None else max(0.0, agora - self._ultimo_instante)
@@ -74,7 +79,7 @@ class ControladorInteracao:
         self.maos_suaves = self.suavizador.atualizar(
             maos_detectadas, dt, mapear_para_tela, agora
         )
-        cena = CenaProjetada(projetor, tetraedro, orientacao)
+        cena = CenaProjetada(projetor, tetraedro, orientacao, distancia_camera)
         self.estado, comando = avaliar_gestos(
             self.estado, self.maos_suaves, cena, self.params, frame_id
         )
@@ -91,11 +96,15 @@ def _params_de_config(config) -> ParametrosGesto:
     return ParametrosGesto(
         pinca_fecha=getattr(config, "PINCA_FECHA", padrao.pinca_fecha),
         pinca_abre=getattr(config, "PINCA_ABRE", padrao.pinca_abre),
-        concha_min_entra=getattr(config, "CONCHA_EXTENSAO_MIN", padrao.concha_min_entra),
-        concha_max_entra=getattr(config, "CONCHA_EXTENSAO_MAX", padrao.concha_max_entra),
-        concha_min_sai=getattr(config, "CONCHA_EXTENSAO_MIN_SAI", padrao.concha_min_sai),
-        concha_max_sai=getattr(config, "CONCHA_EXTENSAO_MAX_SAI", padrao.concha_max_sai),
+        garra_fecha=getattr(config, "GARRA_FECHA", padrao.garra_fecha),
+        garra_abre=getattr(config, "GARRA_ABRE", padrao.garra_abre),
         raio_pick_px=getattr(config, "RAIO_PICK_VERTICE_PX", padrao.raio_pick_px),
-        quadros_confirmacao=getattr(config, "QUADROS_CONFIRMACAO_GESTO", padrao.quadros_confirmacao),
-        tempo_minimo_visivel_s=getattr(config, "TEMPO_MINIMO_MAO_VISIVEL_S", padrao.tempo_minimo_visivel_s),
+        quadros_confirmacao=getattr(
+            config, "QUADROS_CONFIRMACAO_GESTO", padrao.quadros_confirmacao),
+        tempo_minimo_visivel_s=getattr(
+            config, "TEMPO_MINIMO_MAO_VISIVEL_S", padrao.tempo_minimo_visivel_s),
+        razao_profundidade_min=getattr(
+            config, "RAZAO_PROFUNDIDADE_MIN", padrao.razao_profundidade_min),
+        razao_profundidade_max=getattr(
+            config, "RAZAO_PROFUNDIDADE_MAX", padrao.razao_profundidade_max),
     )

@@ -1,9 +1,25 @@
 """Máquina de estados da manipulação direta.
 
-Modelo de controle: só mexe no objeto quando a mão AGARRA de propósito
-(pinça fechada). Mão aberta = objeto parado. Na Etapa 2 qualquer movimento da
-mão já girava o sólido, e não havia como descansar a mão — foi o que o
-usuário leu como "não entendi como mexe, tá bugado".
+Modelo de controle: o objeto flutua num espaço e só se mexe quando uma mão o
+AGARRA de propósito. Mão aberta = objeto parado, exatamente onde foi deixado.
+
+São dois agarres, fisicamente distintos e por isso nunca ambíguos:
+
+- **Garra** (a mão inteira fechando, como apertar um balão): pega o SÓLIDO
+  INTEIRO. Enquanto durar, o objeto fica travado na mão — anda com ela,
+  gira com a palma e chega mais perto quando a mão se aproxima da câmera.
+- **Pinça** (só polegar e indicador, mão aberta no resto): pega UM VÉRTICE e
+  o deforma. É o gesto de precisão.
+
+O que havia antes e foi removido, com o motivo:
+
+- *Órbita por deslocamento na tela* — convertia pixels percorridos em graus a
+  0,35°/px, então atravessar a janela girava o sólido 358° e um tremor de
+  20 px já rodava 7°. Era o "ele fica se movendo loucamente". A garra gira
+  1:1 com a palma: onde a mão aponta, o objeto aponta.
+- *Concha como pose estática* — exigia os quatro dedos numa faixa estreita de
+  curvatura, e essa faixa também aceitava a mão relaxada, então o gesto
+  disparava sozinho.
 
 Tudo aqui é função pura: sem OpenGL, sem relógio implícito, sem I/O. A cena
 entra pelo protocolo `ContextoCena`, que nos testes é uma projeção
@@ -14,25 +30,23 @@ from enum import Enum
 from typing import Optional, Protocol, Sequence
 
 from geometry.transformacoes import Quat, compor_rotacao_relativa
-from vision.hand_tracker import mao_em_concha
+from vision.hand_tracker import mao_em_garra
 
 Vec3 = tuple[float, float, float]
 
 
 class Fase(Enum):
     OCIOSO = "ocioso"
-    GIRANDO_PINCA = "girando_pinca"
+    SEGURANDO_OBJETO = "segurando_objeto"
     ARRASTANDO_VERTICE = "arrastando_vertice"
     ESCALANDO = "escalando"
-    GIRANDO_CONCHA = "girando_concha"
 
 
 MENSAGENS = {
     Fase.OCIOSO: "",
-    Fase.GIRANDO_PINCA: "girando",
+    Fase.SEGURANDO_OBJETO: "segurando o sólido",
     Fase.ARRASTANDO_VERTICE: "deformando vértice {vertice}",
     Fase.ESCALANDO: "redimensionando",
-    Fase.GIRANDO_CONCHA: "girando (concha)",
 }
 
 
@@ -41,15 +55,20 @@ class ParametrosGesto:
     """Limiares com histerese: o valor de ENTRAR difere do de SAIR, senão o
     gesto fica oscilando quando a mão para bem em cima do limiar."""
 
+    # Pinça (precisão): medi punho 0,199 e mão aberta ~1,05.
     pinca_fecha: float = 0.35
     pinca_abre: float = 0.50
-    concha_min_entra: float = 0.50
-    concha_min_sai: float = 0.42
-    concha_max_entra: float = 0.88
-    concha_max_sai: float = 0.94
+    # Garra (mão inteira): medi punho 0,243, apontando 0,434, vitória 0,582.
+    garra_fecha: float = 0.38
+    garra_abre: float = 0.48
     raio_pick_px: float = 45.0
     quadros_confirmacao: int = 2
     tempo_minimo_visivel_s: float = 0.15
+    # Quanto a mão pode chegar/afastar da câmera dentro de um mesmo agarre.
+    # Sem trava, um erro de leitura do tamanho da mão jogaria o sólido para o
+    # infinito ou para dentro da câmera de uma vez.
+    razao_profundidade_min: float = 0.6
+    razao_profundidade_max: float = 1.7
 
 
 @dataclass(frozen=True)
@@ -68,6 +87,8 @@ class EstadoInteracao:
     ponto_medio_anterior: Optional[tuple[float, float]] = None
     orientacao_mao_inicial: Optional[Quat] = None
     orientacao_objeto_inicial: Optional[Quat] = None
+    tamanho_mao_inicial: float = 0.0
+    distancia_camera_inicial: float = 0.0
 
     # debounce de entrada
     candidato: Fase = Fase.OCIOSO
@@ -86,9 +107,9 @@ class ComandoInteracao:
 
     fase: Fase = Fase.OCIOSO
     orientacao_absoluta: Optional[Quat] = None
-    delta_orbita_tela: tuple[float, float] = (0.0, 0.0)
-    escala_absoluta: Optional[float] = None
     delta_pan_tela: tuple[float, float] = (0.0, 0.0)
+    distancia_camera_absoluta: Optional[float] = None
+    escala_absoluta: Optional[float] = None
     vertice_sob_mira: Optional[int] = None
     vertice_movido: Optional[int] = None
     posicao_vertice_objeto: Optional[Vec3] = None
@@ -104,6 +125,8 @@ class ContextoCena(Protocol):
     def orientacao_objeto(self) -> Quat: ...
 
     def escala_objeto(self) -> float: ...
+
+    def distancia_camera(self) -> float: ...
 
 
 # ---------------------------------------------------------------------------
@@ -129,16 +152,28 @@ def vertice_sob_cursor(
     return melhor_indice
 
 
+def esta_em_garra(mao, params: ParametrosGesto, ja_em_garra: bool) -> bool:
+    """Mão inteira fechada, com histerese."""
+    limiar = params.garra_abre if ja_em_garra else params.garra_fecha
+    return mao_em_garra(mao.abertura, limiar)
+
+
 def esta_agarrando(mao, params: ParametrosGesto, ja_agarrando: bool) -> bool:
-    """Pinça com histerese: fecha em `pinca_fecha`, só solta em `pinca_abre`."""
+    """Pinça de precisão: polegar e indicador juntos com a mão ABERTA.
+
+    A exigência de mão aberta é o que separa a pinça da garra. Sem ela o
+    punho fechado dispararia as duas (medi pinça 0,199 num punho), e o
+    usuário nunca saberia se ia deformar um vértice ou mover o sólido.
+    """
+    # A garra é sempre testada pelo limiar ESTRITO, mesmo com a pinça já em
+    # curso. `ja_agarrando` vale para a pinça, não para a garra: reaproveitá-lo
+    # aqui abriria o limiar da garra para 0,48 e a mão que segura um vértice
+    # (abertura ~0,43, dedos esticados) passaria a ser lida como punho,
+    # derrubando o arrasto no meio.
+    if esta_em_garra(mao, params, False):
+        return False
     limiar = params.pinca_abre if ja_agarrando else params.pinca_fecha
     return mao.pinca < limiar
-
-
-def esta_em_concha(mao, params: ParametrosGesto, ja_em_concha: bool) -> bool:
-    minimo = params.concha_min_sai if ja_em_concha else params.concha_min_entra
-    maximo = params.concha_max_sai if ja_em_concha else params.concha_max_entra
-    return mao_em_concha(mao.extensoes, mao.pinca, minimo, maximo, params.pinca_abre)
 
 
 def _distancia(a: tuple[float, float], b: tuple[float, float]) -> float:
@@ -151,6 +186,20 @@ def _ponto_medio(a: tuple[float, float], b: tuple[float, float]) -> tuple[float,
 
 def _por_id(maos: Sequence) -> dict[int, object]:
     return {m.id_mao: m for m in maos}
+
+
+def _profundidade(estado: EstadoInteracao, mao, params: ParametrosGesto) -> Optional[float]:
+    """Distância da câmera a partir de quanto a mão cresceu na imagem.
+
+    A mão chegando perto da câmera aparece maior, então a razão sobe e a
+    distância cai — o sólido vem para frente. É o mapeamento que o usuário
+    esperava de cara ("se eu aproximo a mão, ele fica mais perto").
+    """
+    if estado.tamanho_mao_inicial <= 0 or mao.tamanho <= 0:
+        return None
+    razao = mao.tamanho / estado.tamanho_mao_inicial
+    razao = max(params.razao_profundidade_min, min(params.razao_profundidade_max, razao))
+    return estado.distancia_camera_inicial / razao
 
 
 # ---------------------------------------------------------------------------
@@ -170,11 +219,11 @@ def avaliar_gestos(
     #
     #    Um gesto ancorado num ALVO (o arrasto de um vértice) é protegido:
     #    encostar a outra mão no campo de visão não pode sequestrá-lo.
-    #    Já a órbita com uma mão é genérica e PODE ser promovida a escala
-    #    quando a segunda mão fecha a pinça — as duas mãos praticamente nunca
-    #    entram no quadro no mesmo frame, então sem essa promoção o gesto de
-    #    duas mãos seria impossível de iniciar na prática.
-    if estado.fase is Fase.GIRANDO_PINCA:
+    #    Já segurar o sólido é genérico e PODE virar escala quando a segunda
+    #    mão fecha a garra — as duas mãos praticamente nunca entram no quadro
+    #    no mesmo frame, então sem essa promoção o gesto de duas mãos seria
+    #    impossível de iniciar na prática.
+    if estado.fase is Fase.SEGURANDO_OBJETO:
         promovido = _promover_para_escala(estado, indexadas, maos, cena, params)
         if promovido is not None:
             return promovido
@@ -211,20 +260,21 @@ def avaliar_gestos(
 
 
 def _promover_para_escala(estado, indexadas, maos, cena, params):
-    """Uma segunda mão fechando a pinça durante a órbita inicia a escala.
+    """Uma segunda mão fechando a garra enquanto a primeira segura o sólido
+    inicia a escala.
 
-    Exige que a mão âncora ainda esteja agarrando, senão o gesto já acabou e
+    Exige que a mão âncora ainda esteja segurando, senão o gesto já acabou e
     o caminho normal cuida disso.
     """
     ancora = indexadas.get(estado.id_mao_ancora)
-    if ancora is None or not esta_agarrando(ancora, params, True):
+    if ancora is None or not esta_em_garra(ancora, params, True):
         return None
 
     outras = [
         m for m in maos
         if m.id_mao != estado.id_mao_ancora
         and m.visivel_ha_s >= params.tempo_minimo_visivel_s
-        and esta_agarrando(m, params, False)
+        and esta_em_garra(m, params, False)
     ]
     if not outras:
         return None
@@ -249,28 +299,24 @@ def _vertice_sob_mira(maos, cena, params) -> Optional[int]:
 
 
 def _escolher_candidato(maos, cena, params) -> tuple[Fase, dict]:
-    agarrando = [m for m in maos if esta_agarrando(m, params, False)]
+    em_garra = [m for m in maos if esta_em_garra(m, params, False)]
 
-    if len(agarrando) >= 2:
+    if len(em_garra) >= 2:
         # Ordena por id para a escolha ser determinística entre frames.
-        a, b = sorted(agarrando, key=lambda m: m.id_mao)[:2]
+        a, b = sorted(em_garra, key=lambda m: m.id_mao)[:2]
         return Fase.ESCALANDO, {"ancora": a, "secundaria": b}
 
-    if len(agarrando) == 1:
-        mao = agarrando[0]
-        # A decisão vértice-vs-órbita é tomada UMA vez, aqui na entrada, e
-        # nunca reavaliada durante o gesto — senão o objeto alternaria entre
-        # girar e deformar sempre que o cursor passasse perto de um vértice.
+    # A pinça de precisão é avaliada ANTES da garra de uma mão só: mirar um
+    # vértice é o gesto mais específico e por isso o mais intencional.
+    for mao in sorted(maos, key=lambda m: m.id_mao):
+        if not esta_agarrando(mao, params, False):
+            continue
         indice = vertice_sob_cursor(mao.cursor_tela, cena.vertices_tela(), params.raio_pick_px)
         if indice is not None:
             return Fase.ARRASTANDO_VERTICE, {"ancora": mao, "vertice": indice}
-        return Fase.GIRANDO_PINCA, {"ancora": mao}
 
-    # A pinça sempre vence a concha na mesma mão: geometricamente a pinça é um
-    # caso particular de fechamento, e sem essa regra os dois disparam juntos.
-    em_concha = [m for m in maos if esta_em_concha(m, params, False)]
-    if em_concha:
-        return Fase.GIRANDO_CONCHA, {"ancora": min(em_concha, key=lambda m: m.id_mao)}
+    if em_garra:
+        return Fase.SEGURANDO_OBJETO, {"ancora": em_garra[0]}
 
     return Fase.OCIOSO, {}
 
@@ -292,7 +338,7 @@ def _iniciar(fase: Fase, dados: dict, cena: ContextoCena, frame_id: int) -> Esta
             id_mao_secundaria=secundaria.id_mao,
             distancia_inicial_maos=max(_distancia(ancora.cursor_tela, secundaria.cursor_tela), 1e-6),
             escala_inicial=cena.escala_objeto(),
-            ponto_medio_anterior=_ponto_medio(ancora.cursor_tela, secundaria.cursor_tela),
+            ponto_medio_anterior=_ponto_medio(ancora.palma_tela, secundaria.palma_tela),
         )
 
     if fase is Fase.ARRASTANDO_VERTICE:
@@ -306,14 +352,17 @@ def _iniciar(fase: Fase, dados: dict, cena: ContextoCena, frame_id: int) -> Esta
             offset_cursor_vertice=offset, z_janela_vertice=projetado[2],
         )
 
-    if fase is Fase.GIRANDO_CONCHA:
-        return EstadoInteracao(
-            **comum,
-            orientacao_mao_inicial=ancora.orientacao,
-            orientacao_objeto_inicial=cena.orientacao_objeto(),
-        )
-
-    return EstadoInteracao(**comum)
+    # SEGURANDO_OBJETO: o sólido trava na mão. Guarda a pose da mão e a do
+    # objeto no instante do agarre, e move tudo em relação a elas — assim o
+    # objeto nunca salta ao ser pego e nunca acumula deriva enquanto é levado.
+    return EstadoInteracao(
+        **comum,
+        orientacao_mao_inicial=ancora.orientacao,
+        orientacao_objeto_inicial=cena.orientacao_objeto(),
+        tamanho_mao_inicial=ancora.tamanho,
+        distancia_camera_inicial=cena.distancia_camera(),
+        ponto_medio_anterior=ancora.palma_tela,
+    )
 
 
 def _continuar(estado, indexadas, cena, params):
@@ -326,10 +375,10 @@ def _continuar(estado, indexadas, cena, params):
         secundaria = indexadas.get(estado.id_mao_secundaria)
         if secundaria is None:
             return None
-        if not (esta_agarrando(ancora, params, True) and esta_agarrando(secundaria, params, True)):
+        if not (esta_em_garra(ancora, params, True) and esta_em_garra(secundaria, params, True)):
             return None
         distancia = max(_distancia(ancora.cursor_tela, secundaria.cursor_tela), 1e-6)
-        medio = _ponto_medio(ancora.cursor_tela, secundaria.cursor_tela)
+        medio = _ponto_medio(ancora.palma_tela, secundaria.palma_tela)
         anterior = estado.ponto_medio_anterior or medio
         # Escala absoluta em relação ao início do gesto: acumular razões
         # quadro a quadro derivaria ao longo do tempo.
@@ -344,53 +393,47 @@ def _continuar(estado, indexadas, cena, params):
             ),
         )
 
-    if estado.fase is Fase.GIRANDO_CONCHA:
-        if not esta_em_concha(ancora, params, True):
+    if estado.fase is Fase.SEGURANDO_OBJETO:
+        if not esta_em_garra(ancora, params, True):
             return None
+        anterior = estado.ponto_medio_anterior or ancora.palma_tela
         orientacao = compor_rotacao_relativa(
             estado.orientacao_objeto_inicial,
             estado.orientacao_mao_inicial,
             ancora.orientacao,
         )
         return (
-            _substituir(estado, cursor_anterior=ancora.cursor_tela),
+            _substituir(estado, ponto_medio_anterior=ancora.palma_tela,
+                        cursor_anterior=ancora.cursor_tela),
             ComandoInteracao(
-                fase=estado.fase, orientacao_absoluta=orientacao,
+                fase=estado.fase,
+                orientacao_absoluta=orientacao,
+                delta_pan_tela=(
+                    ancora.palma_tela[0] - anterior[0],
+                    ancora.palma_tela[1] - anterior[1],
+                ),
+                distancia_camera_absoluta=_profundidade(estado, ancora, params),
                 mensagem=MENSAGENS[estado.fase],
             ),
         )
 
+    # ARRASTANDO_VERTICE
     if not esta_agarrando(ancora, params, True):
         return None
 
-    if estado.fase is Fase.ARRASTANDO_VERTICE:
-        alvo_x = ancora.cursor_tela[0] + estado.offset_cursor_vertice[0]
-        alvo_y = ancora.cursor_tela[1] + estado.offset_cursor_vertice[1]
-        # Move no plano paralelo à câmera, preservando a profundidade que o
-        # vértice tinha quando foi agarrado.
-        posicao = cena.desprojetar(alvo_x, alvo_y, estado.z_janela_vertice)
-        return (
-            _substituir(estado, cursor_anterior=ancora.cursor_tela),
-            ComandoInteracao(
-                fase=estado.fase,
-                vertice_movido=estado.vertice_ativo,
-                posicao_vertice_objeto=posicao,
-                vertice_sob_mira=estado.vertice_ativo,
-                mensagem=MENSAGENS[estado.fase].format(vertice=estado.vertice_ativo),
-            ),
-        )
-
-    # GIRANDO_PINCA
-    anterior = estado.cursor_anterior or ancora.cursor_tela
+    alvo_x = ancora.cursor_tela[0] + estado.offset_cursor_vertice[0]
+    alvo_y = ancora.cursor_tela[1] + estado.offset_cursor_vertice[1]
+    # Move no plano paralelo à câmera, preservando a profundidade que o
+    # vértice tinha quando foi agarrado.
+    posicao = cena.desprojetar(alvo_x, alvo_y, estado.z_janela_vertice)
     return (
         _substituir(estado, cursor_anterior=ancora.cursor_tela),
         ComandoInteracao(
             fase=estado.fase,
-            delta_orbita_tela=(
-                ancora.cursor_tela[0] - anterior[0],
-                ancora.cursor_tela[1] - anterior[1],
-            ),
-            mensagem=MENSAGENS[estado.fase],
+            vertice_movido=estado.vertice_ativo,
+            posicao_vertice_objeto=posicao,
+            vertice_sob_mira=estado.vertice_ativo,
+            mensagem=MENSAGENS[estado.fase].format(vertice=estado.vertice_ativo),
         ),
     )
 

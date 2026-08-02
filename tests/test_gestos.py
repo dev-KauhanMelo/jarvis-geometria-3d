@@ -18,7 +18,7 @@ from interaction.gestos import (
     ParametrosGesto,
     avaliar_gestos,
     esta_agarrando,
-    esta_em_concha,
+    esta_em_garra,
     vertice_sob_cursor,
 )
 from interaction.suavizacao import MaoSuave
@@ -26,30 +26,51 @@ from interaction.suavizacao import MaoSuave
 PARAMS = ParametrosGesto()
 PINCA_FECHADA = 0.10
 PINCA_ABERTA = 0.95
-EXT_CONCHA = (0.65, 0.68, 0.66, 0.62)
+# Valores de `abertura_mao` medidos com o MediaPipe em fotos reais.
+ABERTURA_PUNHO = 0.24
+ABERTURA_APONTANDO = 0.43
+ABERTURA_ABERTA = 0.58
 EXT_ABERTA = (0.98, 0.97, 0.96, 0.95)
-EXT_PUNHO = (0.31, 0.25, 0.33, 0.46)
+TAMANHO_PADRAO = 0.30
 
 
 def mao(
-    id_mao=0, x=500.0, y=400.0, pinca=PINCA_ABERTA, extensoes=EXT_ABERTA,
+    id_mao=0, x=500.0, y=400.0, pinca=PINCA_ABERTA, abertura=ABERTURA_ABERTA,
     orientacao=QUAT_IDENTIDADE, visivel_ha_s=1.0, destra=True,
+    tamanho=TAMANHO_PADRAO, palma=None,
 ) -> MaoSuave:
     return MaoSuave(
         id_mao=id_mao, destra=destra, cursor_tela=(x, y), pinca=pinca,
-        extensoes=extensoes, orientacao=orientacao, visivel_ha_s=visivel_ha_s,
+        extensoes=EXT_ABERTA, orientacao=orientacao, visivel_ha_s=visivel_ha_s,
+        palma_tela=palma if palma is not None else (x, y),
+        abertura=abertura, tamanho=tamanho,
     )
+
+
+def garra(id_mao=0, **kw) -> MaoSuave:
+    """Mão inteira fechada: o gesto que pega o sólido."""
+    kw.setdefault("abertura", ABERTURA_PUNHO)
+    kw.setdefault("pinca", PINCA_FECHADA)  # fechar a mão junta polegar e indicador
+    return mao(id_mao=id_mao, **kw)
+
+
+def pinca(id_mao=0, **kw) -> MaoSuave:
+    """Pinça de precisão: polegar e indicador juntos, resto da mão aberto."""
+    kw.setdefault("abertura", ABERTURA_APONTANDO)
+    kw.setdefault("pinca", PINCA_FECHADA)
+    return mao(id_mao=id_mao, **kw)
 
 
 class CenaFalsa:
     """Projeção ortográfica trivial: (x,y,z) do objeto -> pixels."""
 
-    def __init__(self, vertices=None, orientacao=QUAT_IDENTIDADE, escala=1.5):
+    def __init__(self, vertices=None, orientacao=QUAT_IDENTIDADE, escala=1.5, distancia=6.0):
         self._vertices = vertices or [
             (0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)
         ]
         self._orientacao = orientacao
         self._escala = escala
+        self._distancia = distancia
         self.centro = (512.0, 384.0)
         self.zoom = 100.0
 
@@ -67,6 +88,9 @@ class CenaFalsa:
 
     def escala_objeto(self):
         return self._escala
+
+    def distancia_camera(self):
+        return self._distancia
 
 
 def avancar(estado, maos, cena, frame_id, params=PARAMS):
@@ -105,31 +129,33 @@ class TestVerticeSobCursor:
 
 
 class TestHisterese:
+    def test_garra_fecha_no_limiar_de_entrada(self):
+        assert esta_em_garra(mao(abertura=0.30), PARAMS, False) is True
+        assert esta_em_garra(mao(abertura=0.43), PARAMS, False) is False
+
+    def test_garra_ja_fechada_so_solta_no_limiar_maior(self):
+        """Entre 0,38 e 0,48 o gesto continua se já estava segurando — é o que
+        impede o sólido de escapar da mão quando ela treme no limiar."""
+        assert esta_em_garra(mao(abertura=0.43), PARAMS, True) is True
+        assert esta_em_garra(mao(abertura=0.43), PARAMS, False) is False
+        assert esta_em_garra(mao(abertura=0.55), PARAMS, True) is False
+
     def test_pinca_fecha_no_limiar_de_entrada(self):
-        assert esta_agarrando(mao(pinca=0.30), PARAMS, False) is True
-        assert esta_agarrando(mao(pinca=0.40), PARAMS, False) is False
+        assert esta_agarrando(mao(pinca=0.30, abertura=ABERTURA_APONTANDO), PARAMS, False) is True
+        assert esta_agarrando(mao(pinca=0.40, abertura=ABERTURA_APONTANDO), PARAMS, False) is False
 
     def test_pinca_ja_agarrando_so_solta_no_limiar_maior(self):
-        """Entre 0.35 e 0.50 o gesto continua se já estava agarrando — é o que
-        impede o objeto de soltar sozinho quando a mão treme no limiar."""
-        assert esta_agarrando(mao(pinca=0.42), PARAMS, True) is True
-        assert esta_agarrando(mao(pinca=0.42), PARAMS, False) is False
-        assert esta_agarrando(mao(pinca=0.55), PARAMS, True) is False
+        aberta = dict(abertura=ABERTURA_ABERTA)
+        assert esta_agarrando(mao(pinca=0.42, **aberta), PARAMS, True) is True
+        assert esta_agarrando(mao(pinca=0.42, **aberta), PARAMS, False) is False
+        assert esta_agarrando(mao(pinca=0.55, **aberta), PARAMS, True) is False
 
-    def test_concha_tem_histerese_nos_dois_extremos(self):
-        quase_fechada = (0.45, 0.46, 0.47, 0.44)
-        assert esta_em_concha(mao(extensoes=quase_fechada), PARAMS, False) is False
-        assert esta_em_concha(mao(extensoes=quase_fechada), PARAMS, True) is True
-
-    def test_punho_nao_e_concha(self):
-        assert esta_em_concha(mao(extensoes=EXT_PUNHO, pinca=0.13), PARAMS, False) is False
-
-    def test_mao_aberta_nao_e_concha(self):
-        assert esta_em_concha(mao(extensoes=EXT_ABERTA), PARAMS, False) is False
-
-    def test_concha_com_pinca_fechada_nao_conta(self):
-        """Pinça vence concha na mesma mão."""
-        assert esta_em_concha(mao(extensoes=EXT_CONCHA, pinca=PINCA_FECHADA), PARAMS, False) is False
+    def test_punho_fechado_nao_conta_como_pinca(self):
+        """Fechar a mão inteira também aproxima polegar e indicador (medi 0,199
+        num punho). Sem exigir a mão aberta, a garra e a pinça disparariam
+        juntas e o usuário nunca saberia qual das duas ia acontecer."""
+        assert esta_agarrando(garra(), PARAMS, False) is False
+        assert esta_em_garra(garra(), PARAMS, False) is True
 
 
 class TestEntradaNosGestos:
@@ -138,55 +164,71 @@ class TestEntradaNosGestos:
         assert estado.fase is Fase.OCIOSO
         assert comando.fase is Fase.OCIOSO
 
-    def test_uma_pinca_longe_de_vertice_gira(self):
-        estado, _ = confirmar([mao(x=200.0, y=200.0, pinca=PINCA_FECHADA)], CenaFalsa())
-        assert estado.fase is Fase.GIRANDO_PINCA
+    def test_fechar_a_mao_pega_o_solido(self):
+        estado, _ = confirmar([garra(x=200.0, y=200.0)], CenaFalsa())
+        assert estado.fase is Fase.SEGURANDO_OBJETO
 
-    def test_uma_pinca_sobre_vertice_deforma(self):
+    def test_garra_pega_o_solido_mesmo_longe_dele(self):
+        """Não exige mirar: procurar o sólido com a mão fechada antes de ele
+        reagir seria o oposto de "agarrar e travar"."""
+        estado, _ = confirmar([garra(x=50.0, y=50.0)], CenaFalsa())
+        assert estado.fase is Fase.SEGURANDO_OBJETO
+
+    def test_pinca_sobre_vertice_deforma(self):
         cena = CenaFalsa()
         x, y, _ = cena.vertices_tela()[1]
-        estado, _ = confirmar([mao(x=x, y=y, pinca=PINCA_FECHADA)], cena)
+        estado, _ = confirmar([pinca(x=x, y=y)], cena)
         assert estado.fase is Fase.ARRASTANDO_VERTICE
         assert estado.vertice_ativo == 1
 
-    def test_duas_pincas_escalam(self):
-        maos = [mao(id_mao=0, x=300.0, pinca=PINCA_FECHADA),
-                mao(id_mao=1, x=700.0, pinca=PINCA_FECHADA)]
+    def test_pinca_longe_de_qualquer_vertice_nao_faz_nada(self):
+        """A pinça é o gesto de precisão e só serve para vértice. Antes ela
+        virava órbita, e converter pixels em graus fazia o sólido girar 358°
+        ao atravessar a janela — era o "movendo loucamente"."""
+        estado, comando = confirmar([pinca(x=50.0, y=50.0)], CenaFalsa())
+        assert estado.fase is Fase.OCIOSO
+        assert comando.fase is Fase.OCIOSO
+
+    def test_duas_garras_escalam(self):
+        maos = [garra(id_mao=0, x=300.0), garra(id_mao=1, x=700.0)]
         estado, _ = confirmar(maos, CenaFalsa())
         assert estado.fase is Fase.ESCALANDO
         assert {estado.id_mao_ancora, estado.id_mao_secundaria} == {0, 1}
 
-    def test_concha_gira(self):
-        estado, _ = confirmar([mao(x=200.0, y=200.0, extensoes=EXT_CONCHA)], CenaFalsa())
-        assert estado.fase is Fase.GIRANDO_CONCHA
+    def test_vertice_vence_garra_quando_ambos_sao_possiveis(self):
+        """Mirar um vértice com a pinça é mais específico, logo mais
+        intencional, que fechar a mão em qualquer lugar."""
+        cena = CenaFalsa()
+        x, y, _ = cena.vertices_tela()[1]
+        maos = [pinca(id_mao=0, x=x, y=y), garra(id_mao=1, x=900.0)]
+        estado, _ = confirmar(maos, cena)
+        assert estado.fase is Fase.ARRASTANDO_VERTICE
 
     def test_mao_recem_aparecida_nao_dispara_gesto(self):
         """Nos primeiros instantes os landmarks ainda estão convergindo."""
-        recente = mao(pinca=PINCA_FECHADA, x=200.0, visivel_ha_s=0.05)
-        estado, _ = confirmar([recente], CenaFalsa())
+        estado, _ = confirmar([garra(x=200.0, visivel_ha_s=0.05)], CenaFalsa())
         assert estado.fase is Fase.OCIOSO
 
     def test_sem_maos_fica_ocioso(self):
-        estado, comando = confirmar([], CenaFalsa())
+        estado, _ = confirmar([], CenaFalsa())
         assert estado.fase is Fase.OCIOSO
 
 
 class TestDebounce:
     def test_um_unico_frame_nao_dispara(self):
-        m = [mao(x=200.0, y=200.0, pinca=PINCA_FECHADA)]
-        estado, _ = avancar(EstadoInteracao(), m, CenaFalsa(), 1)
+        estado, _ = avancar(EstadoInteracao(), [garra(x=200.0)], CenaFalsa(), 1)
         assert estado.fase is Fase.OCIOSO
 
     def test_dois_frames_consecutivos_disparam(self):
-        m = [mao(x=200.0, y=200.0, pinca=PINCA_FECHADA)]
+        m = [garra(x=200.0)]
         estado, _ = avancar(EstadoInteracao(), m, CenaFalsa(), 1)
         estado, _ = avancar(estado, m, CenaFalsa(), 2)
-        assert estado.fase is Fase.GIRANDO_PINCA
+        assert estado.fase is Fase.SEGURANDO_OBJETO
 
     def test_frame_id_repetido_nao_conta(self):
         """A 60fps de render sobre 25 de detecção, contar frames de render
         faria o debounce filtrar só 33 ms e não pegar landmark ruim."""
-        m = [mao(x=200.0, y=200.0, pinca=PINCA_FECHADA)]
+        m = [garra(x=200.0)]
         estado = EstadoInteracao()
         for _ in range(5):
             estado, _ = avancar(estado, m, CenaFalsa(), 1)  # sempre o mesmo frame_id
@@ -194,11 +236,11 @@ class TestDebounce:
 
     def test_candidato_intermitente_reinicia_a_contagem(self):
         cena = CenaFalsa()
-        agarrando = [mao(x=200.0, y=200.0, pinca=PINCA_FECHADA)]
-        solta = [mao(x=200.0, y=200.0, pinca=PINCA_ABERTA)]
-        estado, _ = avancar(EstadoInteracao(), agarrando, cena, 1)
+        fechada = [garra(x=200.0)]
+        solta = [mao(x=200.0)]
+        estado, _ = avancar(EstadoInteracao(), fechada, cena, 1)
         estado, _ = avancar(estado, solta, cena, 2)
-        estado, _ = avancar(estado, agarrando, cena, 3)
+        estado, _ = avancar(estado, fechada, cena, 3)
         assert estado.fase is Fase.OCIOSO
 
 
@@ -208,117 +250,178 @@ class TestTravamentoDoGesto:
         gesto no meio — falha clássica de usabilidade."""
         cena = CenaFalsa()
         x, y, _ = cena.vertices_tela()[1]
-        estado, _ = confirmar([mao(id_mao=0, x=x, y=y, pinca=PINCA_FECHADA)], cena)
+        estado, _ = confirmar([pinca(id_mao=0, x=x, y=y)], cena)
         assert estado.fase is Fase.ARRASTANDO_VERTICE
 
-        duas = [mao(id_mao=0, x=x, y=y, pinca=PINCA_FECHADA),
-                mao(id_mao=1, x=800.0, y=300.0, pinca=PINCA_FECHADA)]
+        duas = [pinca(id_mao=0, x=x, y=y), garra(id_mao=1, x=800.0, y=300.0)]
         for i in range(5):
             estado, comando = avancar(estado, duas, cena, 10 + i)
         assert estado.fase is Fase.ARRASTANDO_VERTICE
         assert comando.escala_absoluta is None
 
-    def test_segunda_mao_promove_orbita_para_escala(self):
+    def test_segunda_mao_promove_o_agarre_para_escala(self):
         """As duas mãos quase nunca entram no quadro no mesmo frame: a
-        primeira engata a órbita e, sem promoção, o gesto de duas mãos seria
+        primeira engata o agarre e, sem promoção, o gesto de duas mãos seria
         impossível de iniciar na prática."""
         cena = CenaFalsa()
-        estado, _ = confirmar([mao(id_mao=0, x=300.0, y=400.0, pinca=PINCA_FECHADA)], cena)
-        assert estado.fase is Fase.GIRANDO_PINCA
+        estado, _ = confirmar([garra(id_mao=0, x=300.0, y=400.0)], cena)
+        assert estado.fase is Fase.SEGURANDO_OBJETO
 
-        duas = [mao(id_mao=0, x=300.0, y=400.0, pinca=PINCA_FECHADA),
-                mao(id_mao=1, x=700.0, y=400.0, pinca=PINCA_FECHADA)]
-        estado, comando = avancar(estado, duas, cena, 20)
+        duas = [garra(id_mao=0, x=300.0, y=400.0), garra(id_mao=1, x=700.0, y=400.0)]
+        estado, _ = avancar(estado, duas, cena, 20)
         assert estado.fase is Fase.ESCALANDO
         assert {estado.id_mao_ancora, estado.id_mao_secundaria} == {0, 1}
 
     def test_segunda_mao_recem_chegada_nao_promove(self):
         cena = CenaFalsa()
-        estado, _ = confirmar([mao(id_mao=0, x=300.0, y=400.0, pinca=PINCA_FECHADA)], cena)
-        duas = [mao(id_mao=0, x=300.0, y=400.0, pinca=PINCA_FECHADA),
-                mao(id_mao=1, x=700.0, y=400.0, pinca=PINCA_FECHADA, visivel_ha_s=0.02)]
+        estado, _ = confirmar([garra(id_mao=0, x=300.0, y=400.0)], cena)
+        duas = [garra(id_mao=0, x=300.0, y=400.0),
+                garra(id_mao=1, x=700.0, y=400.0, visivel_ha_s=0.02)]
         estado, _ = avancar(estado, duas, cena, 20)
-        assert estado.fase is Fase.GIRANDO_PINCA
+        assert estado.fase is Fase.SEGURANDO_OBJETO
 
     def test_promocao_nao_vale_para_arrasto_de_vertice(self):
         """O arrasto é ancorado num alvo, então continua protegido — este é o
-        contraste que justifica a promoção ser só da órbita."""
+        contraste que justifica a promoção ser só do agarre genérico."""
         cena = CenaFalsa()
         x, y, _ = cena.vertices_tela()[1]
-        estado, _ = confirmar([mao(id_mao=0, x=x, y=y, pinca=PINCA_FECHADA)], cena)
-        assert estado.fase is Fase.ARRASTANDO_VERTICE
-        duas = [mao(id_mao=0, x=x, y=y, pinca=PINCA_FECHADA),
-                mao(id_mao=1, x=800.0, y=300.0, pinca=PINCA_FECHADA)]
+        estado, _ = confirmar([pinca(id_mao=0, x=x, y=y)], cena)
+        duas = [pinca(id_mao=0, x=x, y=y), garra(id_mao=1, x=800.0, y=300.0)]
         estado, _ = avancar(estado, duas, cena, 20)
         assert estado.fase is Fase.ARRASTANDO_VERTICE
 
-    def test_decisao_vertice_vs_orbita_nao_e_reavaliada(self):
-        """Começou girando: passar o cursor sobre um vértice não pode virar
-        deformação no meio do gesto."""
+    def test_agarre_nao_vira_deformacao_no_meio_do_gesto(self):
+        """Começou segurando o sólido: passar a mão sobre um vértice não pode
+        trocar o gesto."""
         cena = CenaFalsa()
-        estado, _ = confirmar([mao(x=200.0, y=200.0, pinca=PINCA_FECHADA)], cena)
-        assert estado.fase is Fase.GIRANDO_PINCA
-
+        estado, _ = confirmar([garra(x=200.0, y=200.0)], cena)
         x, y, _ = cena.vertices_tela()[1]
-        estado, comando = avancar(estado, [mao(x=x, y=y, pinca=PINCA_FECHADA)], cena, 20)
-        assert estado.fase is Fase.GIRANDO_PINCA
+        estado, comando = avancar(estado, [garra(x=x, y=y)], cena, 20)
+        assert estado.fase is Fase.SEGURANDO_OBJETO
         assert comando.vertice_movido is None
 
-    def test_gesto_termina_quando_a_mao_solta(self):
+    def test_gesto_termina_quando_a_mao_abre(self):
         cena = CenaFalsa()
-        estado, _ = confirmar([mao(x=200.0, y=200.0, pinca=PINCA_FECHADA)], cena)
-        estado, comando = avancar(estado, [mao(x=200.0, y=200.0, pinca=PINCA_ABERTA)], cena, 20)
+        estado, _ = confirmar([garra(x=200.0, y=200.0)], cena)
+        estado, comando = avancar(estado, [mao(x=200.0, y=200.0)], cena, 20)
         assert estado.fase is Fase.OCIOSO
         assert comando.fase is Fase.OCIOSO
 
     def test_gesto_termina_quando_a_mao_some(self):
         cena = CenaFalsa()
-        estado, _ = confirmar([mao(x=200.0, y=200.0, pinca=PINCA_FECHADA)], cena)
+        estado, _ = confirmar([garra(x=200.0, y=200.0)], cena)
         estado, _ = avancar(estado, [], cena, 20)
         assert estado.fase is Fase.OCIOSO
 
     def test_escala_termina_se_uma_das_maos_some(self):
         cena = CenaFalsa()
-        maos = [mao(id_mao=0, x=300.0, pinca=PINCA_FECHADA),
-                mao(id_mao=1, x=700.0, pinca=PINCA_FECHADA)]
+        maos = [garra(id_mao=0, x=300.0), garra(id_mao=1, x=700.0)]
         estado, _ = confirmar(maos, cena)
         assert estado.fase is Fase.ESCALANDO
         estado, _ = avancar(estado, [maos[0]], cena, 20)
         assert estado.fase is Fase.OCIOSO
 
 
-class TestComandoDeOrbita:
-    def test_mover_a_mao_agarrada_gera_delta(self):
+class TestSegurarOSolido:
+    def test_mover_a_mao_arrasta_o_solido(self):
         cena = CenaFalsa()
-        estado, _ = confirmar([mao(x=200.0, y=200.0, pinca=PINCA_FECHADA)], cena)
-        estado, comando = avancar(estado, [mao(x=230.0, y=180.0, pinca=PINCA_FECHADA)], cena, 20)
-        assert comando.delta_orbita_tela == pytest.approx((30.0, -20.0))
+        estado, _ = confirmar([garra(x=200.0, y=200.0)], cena)
+        _, comando = avancar(estado, [garra(x=250.0, y=230.0)], cena, 20)
+        assert comando.delta_pan_tela == pytest.approx((50.0, 30.0))
 
-    def test_mao_parada_nao_gera_delta(self):
+    def test_mao_parada_nao_arrasta(self):
         cena = CenaFalsa()
-        estado, _ = confirmar([mao(x=200.0, y=200.0, pinca=PINCA_FECHADA)], cena)
-        estado, comando = avancar(estado, [mao(x=200.0, y=200.0, pinca=PINCA_FECHADA)], cena, 20)
-        assert comando.delta_orbita_tela == pytest.approx((0.0, 0.0))
+        estado, _ = confirmar([garra(x=200.0, y=200.0)], cena)
+        _, comando = avancar(estado, [garra(x=200.0, y=200.0)], cena, 20)
+        assert comando.delta_pan_tela == pytest.approx((0.0, 0.0))
+
+    def test_girar_a_mao_gira_o_solido_no_referencial_da_tela(self):
+        cena = CenaFalsa(orientacao=quaternion_de_eixo_angulo((1.0, 0.0, 0.0), 1.2))
+        estado, _ = confirmar([garra(x=200.0, y=200.0, orientacao=QUAT_IDENTIDADE)], cena)
+        assert estado.fase is Fase.SEGURANDO_OBJETO
+
+        giro = quaternion_de_eixo_angulo((0.0, 1.0, 0.0), 0.7)
+        _, comando = avancar(estado, [garra(x=200.0, y=200.0, orientacao=giro)], cena, 20)
+        for v in [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.3, -0.6, 0.8)]:
+            esperado = aplicar_quaternion(giro, aplicar_quaternion(cena.orientacao_objeto(), v))
+            assert aplicar_quaternion(comando.orientacao_absoluta, v) == pytest.approx(
+                esperado, abs=1e-9)
+
+    def test_mao_parada_nao_gira_o_solido(self):
+        cena = CenaFalsa(orientacao=quaternion_de_eixo_angulo((1.0, 0.0, 0.0), 1.2))
+        parada = garra(x=200.0, y=200.0)
+        estado, _ = confirmar([parada], cena)
+        _, comando = avancar(estado, [parada], cena, 20)
+        for v in [(1.0, 0.0, 0.0), (0.0, 0.0, 1.0)]:
+            assert aplicar_quaternion(comando.orientacao_absoluta, v) == pytest.approx(
+                aplicar_quaternion(cena.orientacao_objeto(), v), abs=1e-9
+            )
+
+    def test_aproximar_a_mao_da_camera_traz_o_solido(self):
+        """A mão perto da câmera aparece maior. É o mapeamento que o usuário
+        esperava sem que ninguém explicasse."""
+        cena = CenaFalsa(distancia=6.0)
+        estado, _ = confirmar([garra(x=400.0, tamanho=0.30)], cena)
+        _, comando = avancar(estado, [garra(x=400.0, tamanho=0.36)], cena, 20)
+        assert comando.distancia_camera_absoluta == pytest.approx(6.0 / 1.2)
+
+    def test_afastar_a_mao_afasta_o_solido(self):
+        cena = CenaFalsa(distancia=6.0)
+        estado, _ = confirmar([garra(x=400.0, tamanho=0.30)], cena)
+        _, comando = avancar(estado, [garra(x=400.0, tamanho=0.24)], cena, 20)
+        assert comando.distancia_camera_absoluta == pytest.approx(6.0 / 0.8)
+
+    def test_profundidade_e_absoluta_e_nao_acumula_deriva(self):
+        """Voltar a mão à distância inicial devolve a distância inicial, por
+        mais que se mexa no meio do caminho."""
+        cena = CenaFalsa(distancia=6.0)
+        estado, _ = confirmar([garra(x=400.0, tamanho=0.30)], cena)
+        for t in (0.36, 0.25, 0.40, 0.28):
+            estado, _ = avancar(estado, [garra(x=400.0, tamanho=t)], cena, 30)
+        _, comando = avancar(estado, [garra(x=400.0, tamanho=0.30)], cena, 40)
+        assert comando.distancia_camera_absoluta == pytest.approx(6.0)
+
+    def test_razao_de_profundidade_e_limitada(self):
+        """Uma leitura ruim do tamanho da mão não pode jogar o sólido para o
+        infinito nem para dentro da câmera."""
+        cena = CenaFalsa(distancia=6.0)
+        estado, _ = confirmar([garra(x=400.0, tamanho=0.30)], cena)
+        _, comando = avancar(estado, [garra(x=400.0, tamanho=3.0)], cena, 20)
+        assert comando.distancia_camera_absoluta == pytest.approx(
+            6.0 / PARAMS.razao_profundidade_max)
+        _, comando = avancar(estado, [garra(x=400.0, tamanho=0.001)], cena, 21)
+        assert comando.distancia_camera_absoluta == pytest.approx(
+            6.0 / PARAMS.razao_profundidade_min)
+
+    def test_o_solido_nao_salta_no_instante_em_que_e_pego(self):
+        """Primeiro frame do agarre: sem deslocamento, sem giro, sem mudança
+        de profundidade — só trava."""
+        cena = CenaFalsa(orientacao=quaternion_de_eixo_angulo((0.0, 1.0, 0.0), 0.4))
+        m = garra(x=200.0, y=300.0, tamanho=0.33,
+                  orientacao=quaternion_de_eixo_angulo((1.0, 0.0, 0.0), 0.9))
+        estado, _ = confirmar([m], cena)
+        _, comando = avancar(estado, [m], cena, 20)
+        assert comando.delta_pan_tela == pytest.approx((0.0, 0.0))
+        assert comando.distancia_camera_absoluta == pytest.approx(6.0)
+        for v in [(1.0, 0.0, 0.0), (0.0, 0.0, 1.0)]:
+            assert aplicar_quaternion(comando.orientacao_absoluta, v) == pytest.approx(
+                aplicar_quaternion(cena.orientacao_objeto(), v), abs=1e-9)
 
 
 class TestComandoDeEscala:
     def test_afastar_as_maos_aumenta(self):
         cena = CenaFalsa(escala=1.5)
-        maos = [mao(id_mao=0, x=400.0, pinca=PINCA_FECHADA),
-                mao(id_mao=1, x=600.0, pinca=PINCA_FECHADA)]
+        maos = [garra(id_mao=0, x=400.0), garra(id_mao=1, x=600.0)]
         estado, _ = confirmar(maos, cena)
-        afastadas = [mao(id_mao=0, x=300.0, pinca=PINCA_FECHADA),
-                     mao(id_mao=1, x=700.0, pinca=PINCA_FECHADA)]
+        afastadas = [garra(id_mao=0, x=300.0), garra(id_mao=1, x=700.0)]
         _, comando = avancar(estado, afastadas, cena, 20)
         assert comando.escala_absoluta == pytest.approx(1.5 * 2.0)
 
     def test_juntar_as_maos_diminui(self):
         cena = CenaFalsa(escala=2.0)
-        maos = [mao(id_mao=0, x=300.0, pinca=PINCA_FECHADA),
-                mao(id_mao=1, x=700.0, pinca=PINCA_FECHADA)]
+        maos = [garra(id_mao=0, x=300.0), garra(id_mao=1, x=700.0)]
         estado, _ = confirmar(maos, cena)
-        juntas = [mao(id_mao=0, x=400.0, pinca=PINCA_FECHADA),
-                  mao(id_mao=1, x=600.0, pinca=PINCA_FECHADA)]
+        juntas = [garra(id_mao=0, x=400.0), garra(id_mao=1, x=600.0)]
         _, comando = avancar(estado, juntas, cena, 20)
         assert comando.escala_absoluta == pytest.approx(1.0)
 
@@ -326,14 +429,12 @@ class TestComandoDeEscala:
         """Voltar as mãos à distância inicial tem de devolver a escala inicial,
         por mais que se mexa no meio do caminho."""
         cena = CenaFalsa(escala=1.5)
-        inicio = [mao(id_mao=0, x=400.0, pinca=PINCA_FECHADA),
-                  mao(id_mao=1, x=600.0, pinca=PINCA_FECHADA)]
+        inicio = [garra(id_mao=0, x=400.0), garra(id_mao=1, x=600.0)]
         estado, _ = confirmar(inicio, cena)
         for larg in (250.0, 350.0, 150.0, 450.0):
             estado, _ = avancar(
                 estado,
-                [mao(id_mao=0, x=500.0 - larg, pinca=PINCA_FECHADA),
-                 mao(id_mao=1, x=500.0 + larg, pinca=PINCA_FECHADA)],
+                [garra(id_mao=0, x=500.0 - larg), garra(id_mao=1, x=500.0 + larg)],
                 cena, 30,
             )
         _, comando = avancar(estado, inicio, cena, 40)
@@ -341,11 +442,9 @@ class TestComandoDeEscala:
 
     def test_mover_as_duas_maos_juntas_faz_pan(self):
         cena = CenaFalsa()
-        maos = [mao(id_mao=0, x=400.0, y=300.0, pinca=PINCA_FECHADA),
-                mao(id_mao=1, x=600.0, y=300.0, pinca=PINCA_FECHADA)]
+        maos = [garra(id_mao=0, x=400.0, y=300.0), garra(id_mao=1, x=600.0, y=300.0)]
         estado, _ = confirmar(maos, cena)
-        deslocadas = [mao(id_mao=0, x=450.0, y=320.0, pinca=PINCA_FECHADA),
-                      mao(id_mao=1, x=650.0, y=320.0, pinca=PINCA_FECHADA)]
+        deslocadas = [garra(id_mao=0, x=450.0, y=320.0), garra(id_mao=1, x=650.0, y=320.0)]
         _, comando = avancar(estado, deslocadas, cena, 20)
         assert comando.delta_pan_tela == pytest.approx((50.0, 20.0))
         assert comando.escala_absoluta == pytest.approx(cena.escala_objeto())
@@ -355,58 +454,27 @@ class TestComandoDeVertice:
     def test_arrastar_leva_o_vertice_para_a_posicao_do_cursor(self):
         cena = CenaFalsa()
         x, y, _ = cena.vertices_tela()[1]
-        estado, _ = confirmar([mao(x=x, y=y, pinca=PINCA_FECHADA)], cena)
-        estado, comando = avancar(estado, [mao(x=x + 100.0, y=y, pinca=PINCA_FECHADA)], cena, 20)
+        estado, _ = confirmar([pinca(x=x, y=y)], cena)
+        _, comando = avancar(estado, [pinca(x=x + 100.0, y=y)], cena, 20)
         assert comando.vertice_movido == 1
         # vértice 1 estava em (1,0,0); cursor andou 100px = 1 unidade
         assert comando.posicao_vertice_objeto == pytest.approx((2.0, 0.0, 0.0))
 
     def test_offset_evita_que_o_vertice_salte_ao_ser_agarrado(self):
-        """Agarrar com o cursor um pouco ao lado do vértice não pode teletransportá-lo."""
+        """Agarrar com o cursor um pouco ao lado do vértice não pode
+        teletransportá-lo."""
         cena = CenaFalsa()
         x, y, _ = cena.vertices_tela()[1]
-        estado, _ = confirmar([mao(x=x - 20.0, y=y + 10.0, pinca=PINCA_FECHADA)], cena)
-        _, comando = avancar(estado, [mao(x=x - 20.0, y=y + 10.0, pinca=PINCA_FECHADA)], cena, 20)
+        estado, _ = confirmar([pinca(x=x - 20.0, y=y + 10.0)], cena)
+        _, comando = avancar(estado, [pinca(x=x - 20.0, y=y + 10.0)], cena, 20)
         assert comando.posicao_vertice_objeto == pytest.approx((1.0, 0.0, 0.0))
-
-
-class TestComandoDeConcha:
-    def test_girar_a_mao_gira_o_objeto_no_referencial_da_tela(self):
-        cena = CenaFalsa(orientacao=quaternion_de_eixo_angulo((1.0, 0.0, 0.0), 1.2))
-        parada = mao(x=200.0, y=200.0, extensoes=EXT_CONCHA, orientacao=QUAT_IDENTIDADE)
-        estado, _ = confirmar([parada], cena)
-        assert estado.fase is Fase.GIRANDO_CONCHA
-
-        giro = quaternion_de_eixo_angulo((0.0, 1.0, 0.0), 0.7)
-        _, comando = avancar(
-            estado, [mao(x=200.0, y=200.0, extensoes=EXT_CONCHA, orientacao=giro)], cena, 20
-        )
-        for v in [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.3, -0.6, 0.8)]:
-            esperado = aplicar_quaternion(giro, aplicar_quaternion(cena.orientacao_objeto(), v))
-            assert aplicar_quaternion(comando.orientacao_absoluta, v) == pytest.approx(esperado, abs=1e-9)
-
-    def test_mao_parada_nao_gira_o_objeto(self):
-        cena = CenaFalsa(orientacao=quaternion_de_eixo_angulo((1.0, 0.0, 0.0), 1.2))
-        parada = mao(x=200.0, y=200.0, extensoes=EXT_CONCHA)
-        estado, _ = confirmar([parada], cena)
-        _, comando = avancar(estado, [parada], cena, 20)
-        for v in [(1.0, 0.0, 0.0), (0.0, 0.0, 1.0)]:
-            assert aplicar_quaternion(comando.orientacao_absoluta, v) == pytest.approx(
-                aplicar_quaternion(cena.orientacao_objeto(), v), abs=1e-9
-            )
-
-    def test_abrir_a_mao_encerra_o_gesto(self):
-        cena = CenaFalsa()
-        estado, _ = confirmar([mao(x=200.0, y=200.0, extensoes=EXT_CONCHA)], cena)
-        estado, _ = avancar(estado, [mao(x=200.0, y=200.0, extensoes=EXT_ABERTA)], cena, 20)
-        assert estado.fase is Fase.OCIOSO
 
 
 class TestRealceDeProximidade:
     def test_indica_o_vertice_sob_a_mira_sem_agarrar(self):
         cena = CenaFalsa()
         x, y, _ = cena.vertices_tela()[2]
-        _, comando = confirmar([mao(x=x, y=y, pinca=PINCA_ABERTA)], cena)
+        _, comando = confirmar([mao(x=x, y=y)], cena)
         assert comando.fase is Fase.OCIOSO
         assert comando.vertice_sob_mira == 2
 
@@ -418,20 +486,17 @@ class TestRealceDeProximidade:
 class TestPureza:
     def test_avaliar_nao_muda_o_estado_recebido(self):
         estado = EstadoInteracao()
-        avancar(estado, [mao(pinca=PINCA_FECHADA, x=200.0, y=200.0)], CenaFalsa(), 1)
+        avancar(estado, [garra(x=200.0)], CenaFalsa(), 1)
         assert estado == EstadoInteracao()
 
     def test_mesma_entrada_produz_mesma_saida(self):
         cena = CenaFalsa()
-        m = [mao(x=200.0, y=200.0, pinca=PINCA_FECHADA)]
-        a = avancar(EstadoInteracao(), m, cena, 1)
-        b = avancar(EstadoInteracao(), m, cena, 1)
-        assert a == b
+        m = [garra(x=200.0)]
+        assert avancar(EstadoInteracao(), m, cena, 1) == avancar(EstadoInteracao(), m, cena, 1)
 
     def test_ordem_das_maos_nao_altera_o_resultado(self):
         cena = CenaFalsa()
-        maos = [mao(id_mao=0, x=300.0, pinca=PINCA_FECHADA),
-                mao(id_mao=1, x=700.0, pinca=PINCA_FECHADA)]
+        maos = [garra(id_mao=0, x=300.0), garra(id_mao=1, x=700.0)]
         estado_a, _ = confirmar(maos, cena)
         estado_b, _ = confirmar(list(reversed(maos)), cena)
         assert estado_a.id_mao_ancora == estado_b.id_mao_ancora

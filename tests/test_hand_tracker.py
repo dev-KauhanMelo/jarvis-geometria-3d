@@ -3,7 +3,6 @@ import pytest
 from vision.hand_tracker import (
     ANELAR_MCP,
     ANELAR_PONTA,
-    DetectorPunhoSustentado,
     INDICADOR_MCP,
     INDICADOR_PONTA,
     MEDIO_MCP,
@@ -135,56 +134,3 @@ class TestAplicarDeadZone:
         # `< limiar`, não `<=`: no valor exatamente igual ao limiar, o delta passa.
         assert aplicar_dead_zone(0.02, limiar=0.02) == 0.02
         assert aplicar_dead_zone(0.0199999, limiar=0.02) == 0.0
-
-
-class _RelogioFalso:
-    def __init__(self, inicio: float = 0.0) -> None:
-        self._agora = inicio
-
-    def avancar(self, segundos: float) -> None:
-        self._agora += segundos
-
-    def __call__(self) -> float:
-        return self._agora
-
-
-class TestDetectorPunhoSustentado:
-    def test_nao_dispara_com_mao_aberta(self):
-        relogio = _RelogioFalso()
-        detector = DetectorPunhoSustentado(duracao_hold=1.0, relogio=relogio)
-        assert detector.atualizar(False) is False
-
-    def test_nao_dispara_antes_da_duracao(self):
-        relogio = _RelogioFalso()
-        detector = DetectorPunhoSustentado(duracao_hold=1.0, relogio=relogio)
-        assert detector.atualizar(True) is False
-        relogio.avancar(0.5)
-        assert detector.atualizar(True) is False
-
-    def test_dispara_exatamente_uma_vez_ao_atingir_duracao(self):
-        relogio = _RelogioFalso()
-        detector = DetectorPunhoSustentado(duracao_hold=1.0, relogio=relogio)
-        detector.atualizar(True)
-        relogio.avancar(1.1)
-        assert detector.atualizar(True) is True
-        assert detector.atualizar(True) is False  # não duplica no mesmo hold
-
-    def test_soltar_antes_do_tempo_zera_o_acumulador(self):
-        relogio = _RelogioFalso()
-        detector = DetectorPunhoSustentado(duracao_hold=1.0, relogio=relogio)
-        detector.atualizar(True)
-        relogio.avancar(0.5)
-        assert detector.atualizar(False) is False  # solta antes da duração completar
-        relogio.avancar(0.6)
-        assert detector.atualizar(True) is False  # reinicia a contagem, não soma com o hold anterior
-
-    def test_permite_novo_disparo_apos_reabrir_a_mao(self):
-        relogio = _RelogioFalso()
-        detector = DetectorPunhoSustentado(duracao_hold=1.0, relogio=relogio)
-        detector.atualizar(True)
-        relogio.avancar(1.1)
-        assert detector.atualizar(True) is True
-        assert detector.atualizar(False) is False
-        detector.atualizar(True)
-        relogio.avancar(1.1)
-        assert detector.atualizar(True) is True

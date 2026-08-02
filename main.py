@@ -10,10 +10,12 @@ Arquitetura final (Etapa 3, ainda não implementada aqui):
     - Ctrl+C (SIGINT) deve encerrar tudo: parar a thread de voz,
       liberar a câmera (vision/camera.py) e fechar o contexto GL.
 
-Etapa 2 (implementada): controle por gestos de mão via webcam
-(vision/hand_tracker.py), com `--mouse` como alternativa via mouse/teclado
-(Etapa 1) — útil para testar sem câmera ou como salvaguarda caso o
-rastreamento de mão falhe ao iniciar.
+Etapa 3 (implementada): o sólido é composto sobre o vídeo da câmera e
+manipulado com as mãos. Fechar a mão inteira ("garra") pega o sólido e o
+trava nela — ele anda, gira e se aproxima junto com a mão; a pinça de
+polegar e indicador pega um vértice e o deforma; duas garras redimensionam.
+`--mouse` continua como alternativa sem câmera (Etapa 1), e é também o
+fallback automático se o rastreamento de mão falhar ao iniciar.
 """
 import argparse
 import sys
@@ -28,7 +30,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--mouse",
         action="store_true",
-        help="Usa mouse/teclado (Etapa 1) em vez de gestos de mão (Etapa 2).",
+        help="Usa mouse/teclado em vez da câmera. O botão do meio simula a "
+             "garra e o direito a pinça, então dá para testar a manipulação "
+             "inteira sem webcam.",
     )
     parser.add_argument(
         "--sem-janela-debug",
@@ -46,8 +50,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--debug-gestos",
         action="store_true",
         help="Mostra no HUD os valores ao vivo usados pelos gestos (fps de "
-             "detecção, abertura dos dedos, pinça). Use para calibrar os "
-             "limiares de config.py para a sua mão.",
+             "detecção, abertura da mão, pinça, tamanho aparente). Use para "
+             "calibrar GARRA_FECHA/PINCA_FECHA em config.py para a sua mão.",
     )
     parser.add_argument(
         "--uma-mao",
