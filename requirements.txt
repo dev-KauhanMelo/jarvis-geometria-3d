@@ -11,3 +11,12 @@ pytest>=8.0
 
 # numpy já está incluído nesta etapa mesmo sem uso direto na geometria,
 # antecipando as Etapas 2/3 (OpenCV e MediaPipe dependem dele).
+
+# Etapa 2 (rastreamento de mão) — testada neste ambiente com Python 3.12.
+mediapipe==1.0.0
+
+# NÃO adicionar opencv-python/opencv-python-headless separadamente: o
+# mediapipe já traz opencv-contrib-python (testado: 5.0.0.93) como
+# dependência transitiva, com suporte a GUI (cv2.imshow) necessário para a
+# janela de debug. Instalar outro pacote de cv2 por cima gera conflito
+# silencioso no import de `cv2`.
