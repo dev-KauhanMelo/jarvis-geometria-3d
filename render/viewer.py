@@ -5,7 +5,7 @@ abstraída pelo protocolo `FonteEntrada`, para que o `Viewer` nunca
 precise mudar quando a fonte de controle trocar.
 """
 from dataclasses import dataclass
-from math import cos, radians, sin
+from math import radians
 from typing import Optional, Protocol
 
 import pygame
@@ -55,7 +55,7 @@ from OpenGL.GL import (
     glOrtho,
     glPopMatrix,
     glPushMatrix,
-    glRotatef,
+    glMultMatrixf,
     glShadeModel,
     glTexCoord2f,
     glTexImage2D,
@@ -70,6 +70,16 @@ from OpenGL.GLU import gluDeleteQuadric, gluNewQuadric, gluPerspective, gluSpher
 
 from config import Config
 from geometry.tetraedro import Tetraedro, calcular_normal_face
+from geometry.transformacoes import (
+    QUAT_IDENTIDADE,
+    Quat,
+    aplicar_quaternion,
+    matriz4_coluna_maior_de_quaternion,
+    multiplicar_quaternions,
+    normalizar_quaternion,
+    quaternion_de_eixo_angulo,
+    quaternion_de_euler_graus,
+)
 
 
 @dataclass
@@ -136,15 +146,19 @@ class FonteEntradaMouseTeclado:
         return estado
 
 
-def _rotacionar_ponto(ponto: tuple[float, float, float], angulo_x: float, angulo_y: float) -> tuple[float, float, float]:
-    """Aplica a mesma rotação (Y depois X) usada em `_desenhar_solido`,
-    usada apenas para estimar profundidade de câmera na ordenação das faces."""
-    x, y, z = ponto
-    rad_y = radians(angulo_y)
-    x, z = x * cos(rad_y) + z * sin(rad_y), -x * sin(rad_y) + z * cos(rad_y)
-    rad_x = radians(angulo_x)
-    y, z = y * cos(rad_x) - z * sin(rad_x), y * sin(rad_x) + z * cos(rad_x)
-    return (x, y, z)
+def _quaternion_de_arrasto(delta_x: float, delta_y: float) -> Quat:
+    """Converte um arrasto na tela (graus) numa rotação de trackball.
+
+    Arrastar na horizontal gira em torno do eixo Y da TELA e na vertical em
+    torno do X da TELA — por isso o quaternion resultante é composto à
+    esquerda da orientação atual (mesma matemática do gesto da mão).
+    """
+    q = QUAT_IDENTIDADE
+    if delta_y:
+        q = multiplicar_quaternions(quaternion_de_eixo_angulo((1.0, 0.0, 0.0), radians(delta_y)), q)
+    if delta_x:
+        q = multiplicar_quaternions(quaternion_de_eixo_angulo((0.0, 1.0, 0.0), radians(delta_x)), q)
+    return q
 
 
 class Viewer:
@@ -164,8 +178,10 @@ class Viewer:
         self.config = config or Config()
         self.fonte_entrada = fonte_entrada or FonteEntradaMouseTeclado()
 
-        self.angulo_x = 20.0
-        self.angulo_y = -30.0
+        # Orientação como quaternion (e não ângulos de Euler): renormalização
+        # barata a cada frame, interpolação por slerp e sem gimbal lock.
+        self.orientacao_inicial: Quat = quaternion_de_euler_graus(20.0, -30.0)
+        self.orientacao: Quat = self.orientacao_inicial
         self.distancia_inicial = 6.0
         self.distancia_camera = self.distancia_inicial
         self.distancia_min = 2.0
@@ -227,8 +243,12 @@ class Viewer:
         if estado.redimensionado is not None:
             self._tratar_redimensionamento(*estado.redimensionado)
 
-        self.angulo_x += estado.delta_rotacao_x
-        self.angulo_y += estado.delta_rotacao_y
+        if estado.delta_rotacao_x or estado.delta_rotacao_y:
+            arrasto = _quaternion_de_arrasto(estado.delta_rotacao_y, estado.delta_rotacao_x)
+            self.orientacao = normalizar_quaternion(
+                multiplicar_quaternions(arrasto, self.orientacao)
+            )
+
         self.distancia_camera = max(
             self.distancia_min, min(self.distancia_max, self.distancia_camera + estado.delta_zoom)
         )
@@ -237,8 +257,7 @@ class Viewer:
 
         if estado.resetar:
             self.tetraedro.resetar()
-            self.angulo_x = 20.0
-            self.angulo_y = -30.0
+            self.orientacao = self.orientacao_inicial
             self.distancia_camera = self.distancia_inicial
 
         if estado.sair:
@@ -253,19 +272,19 @@ class Viewer:
         glMatrixMode(GL_MODELVIEW)
         glLoadIdentity()
         glTranslatef(0.0, 0.0, -self.distancia_camera)
-        glRotatef(self.angulo_x, 1, 0, 0)
-        glRotatef(self.angulo_y, 0, 1, 0)
+        glMultMatrixf(matriz4_coluna_maior_de_quaternion(self.orientacao))
 
         vertices = self.tetraedro.vertices()
         faces = self.tetraedro.faces()
         arestas = self.tetraedro.arestas()
 
         def profundidade_face(face: tuple[int, int, int]) -> float:
+            # A translação da câmera é uniforme, então não altera a ordem
+            # relativa em z — basta rotacionar o centroide da face.
             cx = sum(vertices[i][0] for i in face) / 3
             cy = sum(vertices[i][1] for i in face) / 3
             cz = sum(vertices[i][2] for i in face) / 3
-            _, _, z = _rotacionar_ponto((cx, cy, cz), self.angulo_x, self.angulo_y)
-            return z
+            return aplicar_quaternion(self.orientacao, (cx, cy, cz))[2]
 
         faces_ordenadas = sorted(faces, key=profundidade_face)
 
