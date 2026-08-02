@@ -1,0 +1,13 @@
+# Etapa 1 (geometria + render 3D) — versões testadas neste ambiente (Python 3.12).
+pygame==2.6.1
+PyOpenGL==3.1.10
+numpy>=1.26,<3
+pytest>=8.0
+
+# PyOpenGL-accelerate é omitido de propósito: é um pacote Cython compilado
+# que frequentemente falha o build em versões novas de Python sem toolchain
+# de compilação instalada, e o ganho de performance é irrelevante para
+# renderizar as 4 faces de um tetraedro.
+
+# numpy já está incluído nesta etapa mesmo sem uso direto na geometria,
+# antecipando as Etapas 2/3 (OpenCV e MediaPipe dependem dele).
