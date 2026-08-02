@@ -77,6 +77,8 @@ def main() -> int:
         config.AR_ATIVO = False
     if args.uma_mao:
         config.HAND_MAX_NUM_HANDS = 1
+    if args.debug_gestos:
+        config.DEBUG_GESTOS = True
 
     tetraedro = Tetraedro(
         aresta=config.ARESTA_INICIAL,

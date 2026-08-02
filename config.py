@@ -93,6 +93,9 @@ class Config:
     # ruído, então aqui vale privilegiar a latência.
     TAU_PINCA: float = 0.03
 
+    # Ligado por --debug-gestos: mostra os valores crus no HUD para calibração.
+    DEBUG_GESTOS: bool = False
+
     # Conversão de pixels de tela para as unidades da cena.
     SENSIBILIDADE_ORBITA_PX: float = 0.35   # graus de rotação por pixel
     SENSIBILIDADE_PAN_PX: float = 0.006     # unidades de mundo por pixel

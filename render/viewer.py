@@ -56,8 +56,18 @@ from OpenGL.GLU import gluDeleteQuadric, gluNewQuadric, gluPerspective, gluSpher
 
 from config import Config
 from geometry.tetraedro import Tetraedro, calcular_normal_face
+from geometry.transformacoes import (
+    QUAT_IDENTIDADE,
+    Quat,
+    aplicar_quaternion,
+    matriz4_coluna_maior_de_quaternion,
+    multiplicar_quaternions,
+    normalizar_quaternion,
+    quaternion_de_eixo_angulo,
+    quaternion_de_euler_graus,
+)
 from interaction.controlador import ControladorInteracao
-from interaction.gestos import ComandoInteracao, Fase
+from interaction.gestos import ComandoInteracao, Fase, esta_agarrando, esta_em_concha
 from render.ar import FundoCamera, mapear_uv_para_tela
 from render.hud import (
     AMBAR,
@@ -69,21 +79,12 @@ from render.hud import (
     desenhar_circulo,
 )
 
+from render.projecao import ProjetorOpenGL
+
 # Cores do feedback de manipulação (0-1, para o OpenGL).
 COR_LIVRE = (0.85, 0.88, 0.95)      # mão presente, nada agarrado
 COR_AGARRANDO = (0.35, 0.95, 0.55)  # gesto ativo
 COR_MIRA = (1.0, 0.78, 0.20)        # vértice que seria pego
-from render.projecao import ProjetorOpenGL
-from geometry.transformacoes import (
-    QUAT_IDENTIDADE,
-    Quat,
-    aplicar_quaternion,
-    matriz4_coluna_maior_de_quaternion,
-    multiplicar_quaternions,
-    normalizar_quaternion,
-    quaternion_de_eixo_angulo,
-    quaternion_de_euler_graus,
-)
 
 
 @dataclass
@@ -504,6 +505,35 @@ class Viewer:
             cor = VERDE if self._estado_camera == "conectado" else AMBAR
             linhas.append((f"Câmera: {self._estado_camera}", cor))
         linhas += [(texto, BRANCO) for texto in self._diagnostico]
+        linhas += self._linhas_calibracao()
+        return linhas
+
+    def _linhas_calibracao(self) -> list[tuple[str, tuple[int, int, int]]]:
+        """Valores crus por mão, para calibrar os limiares (`--debug-gestos`).
+
+        Os limiares da concha vêm de fotos onde consegui confirmar apenas os
+        NEGATIVOS (punho, dedo apontando e "vitória" são rejeitados). A faixa
+        que aceita a concha depende de quanto a mão de cada pessoa dobra, e é
+        isto aqui que permite ajustá-la: faça a concha, leia os quatro
+        números e mexa em CONCHA_EXTENSAO_MIN/MAX no config.py.
+        """
+        if not getattr(self.config, "DEBUG_GESTOS", False):
+            return []
+
+        params = self._controlador.params
+        linhas = [(
+            f"faixa da concha: {params.concha_min_entra:.2f}–{params.concha_max_entra:.2f}"
+            f" | pinça fecha < {params.pinca_fecha:.2f}", BRANCO,
+        )]
+        for mao in self._controlador.maos_suaves:
+            ext = " ".join(f"{e:.2f}" for e in mao.extensoes)
+            concha = esta_em_concha(mao, params, False)
+            agarrando = esta_agarrando(mao, params, False)
+            marca = "CONCHA" if concha else ("PINÇA" if agarrando else "—")
+            cor = VERDE if (concha or agarrando) else BRANCO
+            linhas.append((
+                f"mão {mao.id_mao} ext: {ext} | pinça: {mao.pinca:.2f} | {marca}", cor,
+            ))
         return linhas
 
     def _desenhar_overlay(self) -> None:
